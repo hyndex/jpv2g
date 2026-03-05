@@ -1,0 +1,9 @@
+build/
+build-*/
+.pio/
+.idea/
+.vscode/
+*.o
+*.a
+*.so
+*.dylib
