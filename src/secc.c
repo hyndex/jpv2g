@@ -836,6 +836,40 @@ static void secc_set_din_physical(struct din_PhysicalValueType *pv, din_unitSymb
     pv->Multiplier = mult;
 }
 
+typedef union {
+    struct iso2_PreChargeReqType iso_pre_charge;
+    struct iso2_CurrentDemandReqType iso_current_demand;
+    struct din_PreChargeReqType din_pre_charge;
+    struct din_CurrentDemandReqType din_current_demand;
+} secc_log_req_copy_t;
+
+static const void *secc_copy_req_body_for_log(jpv2g_protocol_t protocol,
+                                              jpv2g_message_type_t mtype,
+                                              const void *body,
+                                              secc_log_req_copy_t *copy) {
+    if (!body || !copy) return body;
+    if (protocol == JPV2G_PROTOCOL_ISO15118_2) {
+        if (mtype == JPV2G_PRE_CHARGE_REQ) {
+            copy->iso_pre_charge = *(const struct iso2_PreChargeReqType *)body;
+            return &copy->iso_pre_charge;
+        }
+        if (mtype == JPV2G_CURRENT_DEMAND_REQ) {
+            copy->iso_current_demand = *(const struct iso2_CurrentDemandReqType *)body;
+            return &copy->iso_current_demand;
+        }
+    } else if (protocol == JPV2G_PROTOCOL_DIN70121) {
+        if (mtype == JPV2G_PRE_CHARGE_REQ) {
+            copy->din_pre_charge = *(const struct din_PreChargeReqType *)body;
+            return &copy->din_pre_charge;
+        }
+        if (mtype == JPV2G_CURRENT_DEMAND_REQ) {
+            copy->din_current_demand = *(const struct din_CurrentDemandReqType *)body;
+            return &copy->din_current_demand;
+        }
+    }
+    return body;
+}
+
 int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
                                 jpv2g_message_type_t type,
                                 const jpv2g_secc_request_t *req,
@@ -992,9 +1026,29 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
         }
         case JPV2G_PRE_CHARGE_REQ: {
             if (req->protocol == JPV2G_PROTOCOL_DIN70121) {
-                return jpv2g_cbv2g_encode_din_pre_charge_res(sid, din_responseCodeType_OK, NULL, out, out_len, written);
+                struct din_PreChargeResType res;
+                init_din_PreChargeResType(&res);
+                secc_set_dc_evse_status_din(&res.DC_EVSEStatus);
+                if (req->body) {
+                    const struct din_PreChargeReqType *rq = (const struct din_PreChargeReqType *)req->body;
+                    res.EVSEPresentVoltage = rq->EVTargetVoltage;
+                } else {
+                    secc_set_din_physical(&res.EVSEPresentVoltage, din_unitSymbolType_V, 400, 0);
+                }
+                return jpv2g_cbv2g_encode_din_pre_charge_res(sid, din_responseCodeType_OK, &res, out, out_len, written);
             }
-            return jpv2g_cbv2g_encode_pre_charge_res(sid, iso2_responseCodeType_OK, NULL, out, out_len, written);
+            struct iso2_PreChargeResType res;
+            init_iso2_PreChargeResType(&res);
+            secc_set_dc_evse_status_iso(&res.DC_EVSEStatus);
+            if (req->body) {
+                const struct iso2_PreChargeReqType *rq = (const struct iso2_PreChargeReqType *)req->body;
+                res.EVSEPresentVoltage = rq->EVTargetVoltage;
+            } else {
+                res.EVSEPresentVoltage.Unit = iso2_unitSymbolType_V;
+                res.EVSEPresentVoltage.Value = 400;
+                res.EVSEPresentVoltage.Multiplier = 0;
+            }
+            return jpv2g_cbv2g_encode_pre_charge_res(sid, iso2_responseCodeType_OK, &res, out, out_len, written);
         }
         case JPV2G_POWER_DELIVERY_REQ: {
             if (req->protocol == JPV2G_PROTOCOL_DIN70121) {
@@ -1010,20 +1064,35 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
                 struct din_CurrentDemandResType res;
                 init_din_CurrentDemandResType(&res);
                 secc_set_dc_evse_status_din(&res.DC_EVSEStatus);
-                secc_set_din_physical(&res.EVSEPresentVoltage, din_unitSymbolType_V, 400, 0);
-                secc_set_din_physical(&res.EVSEPresentCurrent, din_unitSymbolType_A, 16, 0);
+                if (req->body) {
+                    const struct din_CurrentDemandReqType *rq = (const struct din_CurrentDemandReqType *)req->body;
+                    res.EVSEPresentVoltage = rq->EVTargetVoltage;
+                    res.EVSEPresentCurrent = rq->EVTargetCurrent;
+                } else {
+                    secc_set_din_physical(&res.EVSEPresentVoltage, din_unitSymbolType_V, 400, 0);
+                    secc_set_din_physical(&res.EVSEPresentCurrent, din_unitSymbolType_A, 16, 0);
+                }
+                res.EVSECurrentLimitAchieved = 0;
+                res.EVSEVoltageLimitAchieved = 0;
+                res.EVSEPowerLimitAchieved = 0;
                 secc_bump_meter(secc, 100);
                 return jpv2g_cbv2g_encode_din_current_demand_res(sid, din_responseCodeType_OK, &res, out, out_len, written);
             }
             struct iso2_CurrentDemandResType res;
             init_iso2_CurrentDemandResType(&res);
             secc_set_dc_evse_status_iso(&res.DC_EVSEStatus);
-            res.EVSEPresentVoltage.Unit = iso2_unitSymbolType_V;
-            res.EVSEPresentVoltage.Value = 400;
-            res.EVSEPresentCurrent.Unit = iso2_unitSymbolType_A;
-            res.EVSEPresentCurrent.Value = 16;
-            res.EVSEPresentVoltage.Multiplier = 0;
-            res.EVSEPresentCurrent.Multiplier = 0;
+            if (req->body) {
+                const struct iso2_CurrentDemandReqType *rq = (const struct iso2_CurrentDemandReqType *)req->body;
+                res.EVSEPresentVoltage = rq->EVTargetVoltage;
+                res.EVSEPresentCurrent = rq->EVTargetCurrent;
+            } else {
+                res.EVSEPresentVoltage.Unit = iso2_unitSymbolType_V;
+                res.EVSEPresentVoltage.Value = 400;
+                res.EVSEPresentCurrent.Unit = iso2_unitSymbolType_A;
+                res.EVSEPresentCurrent.Value = 16;
+                res.EVSEPresentVoltage.Multiplier = 0;
+                res.EVSEPresentCurrent.Multiplier = 0;
+            }
             res.EVSECurrentLimitAchieved = 0;
             res.EVSEVoltageLimitAchieved = 0;
             res.EVSEPowerLimitAchieved = 0;
@@ -1196,6 +1265,8 @@ static int jpv2g_secc_handle_stream(jpv2g_secc_t *secc,
         size_t out_len = 0;
         int handler_rc = 0;
         jpv2g_secc_request_t req_ctx = {.protocol = protocol, .header = NULL, .din_header = NULL, .body = NULL};
+        jpv2g_secc_request_t req_log_ctx = req_ctx;
+        secc_log_req_copy_t req_log_copy;
         bool decoded_ok = false;
 
         /* Try to decode as AppProtocol */
@@ -1211,6 +1282,7 @@ static int jpv2g_secc_handle_stream(jpv2g_secc_t *secc,
             if (detected != JPV2G_PROTOCOL_UNKNOWN) protocol = detected;
             req_ctx.protocol = protocol;
             req_ctx.body = &app_req;
+            req_log_ctx = req_ctx;
             if (secc->handle_request) {
                 handler_rc = secc->handle_request(mtype, &req_ctx, out_payload, sizeof(out_payload), &out_len, secc->user_ctx);
             } else {
@@ -1286,6 +1358,8 @@ static int jpv2g_secc_handle_stream(jpv2g_secc_t *secc,
                     req_ctx.header = &iso_doc.V2G_Message.Header;
                     req_ctx.din_header = NULL;
                     req_ctx.body = decoded;
+                    req_log_ctx = req_ctx;
+                    req_log_ctx.body = secc_copy_req_body_for_log(req_ctx.protocol, mtype, req_ctx.body, &req_log_copy);
                     if (secc->handle_request) {
                         handler_rc = secc->handle_request(mtype, &req_ctx, out_payload, sizeof(out_payload), &out_len, secc->user_ctx);
                     } else {
@@ -1363,6 +1437,8 @@ static int jpv2g_secc_handle_stream(jpv2g_secc_t *secc,
                     req_ctx.header = NULL;
                     req_ctx.din_header = &din_doc.V2G_Message.Header;
                     req_ctx.body = decoded;
+                    req_log_ctx = req_ctx;
+                    req_log_ctx.body = secc_copy_req_body_for_log(req_ctx.protocol, mtype, req_ctx.body, &req_log_copy);
                     if (secc->handle_request) {
                         handler_rc = secc->handle_request(mtype, &req_ctx, out_payload, sizeof(out_payload), &out_len, secc->user_ctx);
                     } else {
@@ -1391,7 +1467,7 @@ static int jpv2g_secc_handle_stream(jpv2g_secc_t *secc,
             return handler_rc;
         }
         if (out_len == 0) return -EIO;
-        secc_log_decoded_transaction(mtype, &req_ctx, out_payload, out_len);
+        secc_log_decoded_transaction(mtype, &req_log_ctx, out_payload, out_len);
         secc_log_exi_hex("TX", mtype, out_payload, out_len);
         uint8_t out[JPV2G_V2GTP_HEADER_LEN + JPV2G_MAX_EXI_SIZE];
         size_t total = 0;
