@@ -184,6 +184,25 @@ static double secc_din_pv_to_double(const struct din_PhysicalValueType *pv) {
     return (double)pv->Value * secc_pow10_i8(pv->Multiplier);
 }
 
+static bool secc_iso_cap_precharge_current(struct iso2_PreChargeReqType *rq) {
+    if (!rq) return false;
+    if (secc_iso_pv_to_double(&rq->EVTargetCurrent) <= 2.0) return false;
+    rq->EVTargetCurrent.Multiplier = 0;
+    rq->EVTargetCurrent.Unit = iso2_unitSymbolType_A;
+    rq->EVTargetCurrent.Value = 2;
+    return true;
+}
+
+static bool secc_din_cap_precharge_current(struct din_PreChargeReqType *rq) {
+    if (!rq) return false;
+    if (secc_din_pv_to_double(&rq->EVTargetCurrent) <= 2.0) return false;
+    rq->EVTargetCurrent.Multiplier = 0;
+    rq->EVTargetCurrent.Unit_isUsed = 1;
+    rq->EVTargetCurrent.Unit = din_unitSymbolType_A;
+    rq->EVTargetCurrent.Value = 2;
+    return true;
+}
+
 static int64_t secc_iso_pv_or_neg1(const struct iso2_PhysicalValueType *pv, unsigned used) {
     if (!pv || !used) return -1;
     return (int64_t)secc_iso_pv_to_double(pv);
@@ -851,6 +870,7 @@ static const void *secc_copy_req_body_for_log(jpv2g_protocol_t protocol,
     if (protocol == JPV2G_PROTOCOL_ISO15118_2) {
         if (mtype == JPV2G_PRE_CHARGE_REQ) {
             copy->iso_pre_charge = *(const struct iso2_PreChargeReqType *)body;
+            (void)secc_iso_cap_precharge_current(&copy->iso_pre_charge);
             return &copy->iso_pre_charge;
         }
         if (mtype == JPV2G_CURRENT_DEMAND_REQ) {
@@ -860,6 +880,7 @@ static const void *secc_copy_req_body_for_log(jpv2g_protocol_t protocol,
     } else if (protocol == JPV2G_PROTOCOL_DIN70121) {
         if (mtype == JPV2G_PRE_CHARGE_REQ) {
             copy->din_pre_charge = *(const struct din_PreChargeReqType *)body;
+            (void)secc_din_cap_precharge_current(&copy->din_pre_charge);
             return &copy->din_pre_charge;
         }
         if (mtype == JPV2G_CURRENT_DEMAND_REQ) {
@@ -1031,7 +1052,11 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
                 secc_set_dc_evse_status_din(&res.DC_EVSEStatus);
                 if (req->body) {
                     const struct din_PreChargeReqType *rq = (const struct din_PreChargeReqType *)req->body;
-                    res.EVSEPresentVoltage = rq->EVTargetVoltage;
+                    struct din_PreChargeReqType rq_eff = *rq;
+                    if (secc_din_cap_precharge_current(&rq_eff)) {
+                        JPV2G_INFO("PreCharge current limited to 2.0A (DIN)");
+                    }
+                    res.EVSEPresentVoltage = rq_eff.EVTargetVoltage;
                 } else {
                     secc_set_din_physical(&res.EVSEPresentVoltage, din_unitSymbolType_V, 400, 0);
                 }
@@ -1042,7 +1067,11 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
             secc_set_dc_evse_status_iso(&res.DC_EVSEStatus);
             if (req->body) {
                 const struct iso2_PreChargeReqType *rq = (const struct iso2_PreChargeReqType *)req->body;
-                res.EVSEPresentVoltage = rq->EVTargetVoltage;
+                struct iso2_PreChargeReqType rq_eff = *rq;
+                if (secc_iso_cap_precharge_current(&rq_eff)) {
+                    JPV2G_INFO("PreCharge current limited to 2.0A (ISO)");
+                }
+                res.EVSEPresentVoltage = rq_eff.EVTargetVoltage;
             } else {
                 res.EVSEPresentVoltage.Unit = iso2_unitSymbolType_V;
                 res.EVSEPresentVoltage.Value = 400;
