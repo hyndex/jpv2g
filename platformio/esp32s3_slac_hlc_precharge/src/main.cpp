@@ -77,7 +77,7 @@ constexpr int HLC_IDLE_TIMEOUT_MS = 60000;
 constexpr uint32_t HLC_TASK_STACK_WORDS = 65536;
 constexpr UBaseType_t HLC_CLIENT_QUEUE_DEPTH = 2;
 constexpr UBaseType_t LWIP_TX_QUEUE_DEPTH = 12;
-constexpr bool ENABLE_DECODED_LOGS = true;
+constexpr bool ENABLE_DECODED_LOGS = false;
 
 constexpr uint16_t QCA7K_SPI_READ = (1u << 15);
 constexpr uint16_t QCA7K_SPI_WRITE = (0u << 15);

@@ -35,6 +35,7 @@
 #include "jpv2g/time_compat.h"
 
 static bool s_enable_decoded_logs = true;
+static const uint32_t SECC_CURRENT_DEMAND_LOG_EVERY = 50u;
 
 void jpv2g_secc_set_decoded_logs(bool enable) {
     s_enable_decoded_logs = enable;
@@ -182,6 +183,11 @@ static double secc_iso_pv_to_double(const struct iso2_PhysicalValueType *pv) {
 static double secc_din_pv_to_double(const struct din_PhysicalValueType *pv) {
     if (!pv) return 0.0;
     return (double)pv->Value * secc_pow10_i8(pv->Multiplier);
+}
+
+static bool secc_should_log_current_demand(uint32_t loop_count) {
+    if (loop_count == 0u) return false;
+    return (loop_count % SECC_CURRENT_DEMAND_LOG_EVERY) == 0u;
 }
 
 static bool secc_iso_cap_precharge_current(struct iso2_PreChargeReqType *rq) {
@@ -472,8 +478,9 @@ static void secc_log_decoded_iso(jpv2g_message_type_t mtype,
             if (rq->SelectedServiceList.SelectedService.arrayLen > 0) {
                 psid = (int16_t)rq->SelectedServiceList.SelectedService.array[0].ServiceID;
             }
-            JPV2G_INFO("DECODED ISO {\"msg\":\"PaymentServiceSelection\",\"req\":{\"payment\":\"%s\",\"serviceId\":%d},\"res\":{\"responseCode\":\"%s\"}}",
+            JPV2G_INFO("DECODED ISO {\"msg\":\"PaymentServiceSelection\",\"req\":{\"payment\":\"%s\",\"paymentRaw\":%d,\"serviceId\":%d},\"res\":{\"responseCode\":\"%s\"}}",
                        secc_iso_payment_str(rq->SelectedPaymentOption),
+                       (int)rq->SelectedPaymentOption,
                        (int)psid,
                        secc_iso_resp_code_str(rb->PaymentServiceSelectionRes.ResponseCode));
             break;
@@ -556,6 +563,7 @@ static void secc_log_decoded_iso(jpv2g_message_type_t mtype,
             const struct iso2_CurrentDemandReqType *rq = (const struct iso2_CurrentDemandReqType *)req->body;
             if (!rb->CurrentDemandRes_isUsed) break;
             s_iso_current_demand_loop++;
+            if (!secc_should_log_current_demand(s_iso_current_demand_loop)) break;
             const struct iso2_CurrentDemandResType *rs = &rb->CurrentDemandRes;
             int64_t wh = (rs->MeterInfo_isUsed && rs->MeterInfo.MeterReading_isUsed) ? (int64_t)rs->MeterInfo.MeterReading : -1;
             JPV2G_INFO("DECODED ISO {\"msg\":\"CurrentDemand\",\"loop\":%u,\"req\":{\"targetV\":%.1f,\"targetI\":%.1f,\"soc\":%d,\"chargingComplete\":%d,\"bulkChargingComplete\":%d,\"remainingFullS\":%lld,\"remainingBulkS\":%lld},\"res\":{\"responseCode\":\"%s\",\"status\":\"%s\",\"v\":%.1f,\"i\":%.1f,\"wh\":%lld}}",
@@ -629,6 +637,7 @@ static void secc_log_decoded_din(jpv2g_message_type_t mtype,
             if (!rb->CurrentDemandRes_isUsed) break;
             const struct din_CurrentDemandResType *rs = &rb->CurrentDemandRes;
             s_din_current_demand_loop++;
+            if (!secc_should_log_current_demand(s_din_current_demand_loop)) break;
             JPV2G_INFO("DECODED DIN {\"msg\":\"CurrentDemand\",\"loop\":%u,\"req\":{\"targetV\":%.1f,\"targetI\":%.1f,\"soc\":%d,\"chargingComplete\":%d,\"bulkChargingComplete\":%d,\"remainingFullS\":%lld,\"remainingBulkS\":%lld},\"res\":{\"responseCode\":\"%s\",\"status\":\"%s\",\"v\":%.1f,\"i\":%.1f}}",
                        (unsigned)s_din_current_demand_loop,
                        secc_din_pv_to_double(&rq->EVTargetVoltage),
@@ -856,6 +865,8 @@ static void secc_set_din_physical(struct din_PhysicalValueType *pv, din_unitSymb
 }
 
 typedef union {
+    struct iso2_ChargeParameterDiscoveryReqType iso_charge_parameter_discovery;
+    struct iso2_PaymentServiceSelectionReqType iso_payment_service_selection;
     struct iso2_PreChargeReqType iso_pre_charge;
     struct iso2_CurrentDemandReqType iso_current_demand;
     struct din_PreChargeReqType din_pre_charge;
@@ -868,6 +879,14 @@ static const void *secc_copy_req_body_for_log(jpv2g_protocol_t protocol,
                                               secc_log_req_copy_t *copy) {
     if (!body || !copy) return body;
     if (protocol == JPV2G_PROTOCOL_ISO15118_2) {
+        if (mtype == JPV2G_CHARGE_PARAMETER_DISCOVERY_REQ) {
+            copy->iso_charge_parameter_discovery = *(const struct iso2_ChargeParameterDiscoveryReqType *)body;
+            return &copy->iso_charge_parameter_discovery;
+        }
+        if (mtype == JPV2G_PAYMENT_SERVICE_SELECTION_REQ) {
+            copy->iso_payment_service_selection = *(const struct iso2_PaymentServiceSelectionReqType *)body;
+            return &copy->iso_payment_service_selection;
+        }
         if (mtype == JPV2G_PRE_CHARGE_REQ) {
             copy->iso_pre_charge = *(const struct iso2_PreChargeReqType *)body;
             (void)secc_iso_cap_precharge_current(&copy->iso_pre_charge);
