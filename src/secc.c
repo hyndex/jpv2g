@@ -95,13 +95,17 @@ static jpv2g_protocol_t detect_protocol_from_app(const struct appHand_supportedA
         uint8_t prio = ap->Priority;
         if (prio > best_prio) continue;
         if (ns_contains(ns, ns_len, "iso:15118:2") || ns_contains(ns, ns_len, "iso:15118-2")) {
-            best = JPV2G_PROTOCOL_ISO15118_2;
-            best_prio = prio;
+            if (prio < best_prio || best == JPV2G_PROTOCOL_UNKNOWN || best == JPV2G_PROTOCOL_DIN70121) {
+                best = JPV2G_PROTOCOL_ISO15118_2;
+                best_prio = prio;
+            }
             continue;
         }
         if (ns_contains(ns, ns_len, "din:70121")) {
-            best = JPV2G_PROTOCOL_DIN70121;
-            best_prio = prio;
+            if (prio < best_prio || best == JPV2G_PROTOCOL_UNKNOWN) {
+                best = JPV2G_PROTOCOL_DIN70121;
+                best_prio = prio;
+            }
         }
     }
     return best;
@@ -771,7 +775,7 @@ static iso2_EnergyTransferModeType secc_select_iso_etm(const jpv2g_secc_t *secc)
 
 static din_EVSESupportedEnergyTransferType secc_select_din_etm(const jpv2g_secc_t *secc) {
     (void)secc;
-    return din_EVSESupportedEnergyTransferType_DC_extended;
+    return din_EVSESupportedEnergyTransferType_DC_combo_core;
 }
 
 static bool secc_iso_etm_supported(iso2_EnergyTransferModeType etm) {
@@ -977,10 +981,10 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
             if (req->protocol == JPV2G_PROTOCOL_DIN70121) {
                 return jpv2g_cbv2g_encode_din_service_discovery_res(sid,
                                                                      din_responseCodeType_OK,
-                                                                     din_paymentOptionType_ExternalPayment,
+                                                                     din_paymentOptionType_Contract,
                                                                      secc_select_din_etm(secc),
                                                                      1,
-                                                                     NULL,
+                                                                     "DCFC",
                                                                      free_service,
                                                                      out,
                                                                      out_len,
