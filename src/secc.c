@@ -35,7 +35,13 @@
 #include "jpv2g/time_compat.h"
 
 static bool s_enable_decoded_logs = true;
-static const uint32_t SECC_CURRENT_DEMAND_LOG_EVERY = 50u;
+static bool s_enable_timing_logs = true;
+static const uint32_t SECC_CURRENT_DEMAND_LOG_EVERY = 1u;
+
+static bool secc_timing_log_enabled(jpv2g_message_type_t mtype) {
+    return s_enable_timing_logs &&
+           (mtype == JPV2G_PRE_CHARGE_REQ || mtype == JPV2G_POWER_DELIVERY_REQ || mtype == JPV2G_CURRENT_DEMAND_REQ);
+}
 
 void jpv2g_secc_set_decoded_logs(bool enable) {
     s_enable_decoded_logs = enable;
@@ -43,6 +49,14 @@ void jpv2g_secc_set_decoded_logs(bool enable) {
 
 bool jpv2g_secc_get_decoded_logs(void) {
     return s_enable_decoded_logs;
+}
+
+void jpv2g_secc_set_timing_logs(bool enable) {
+    s_enable_timing_logs = enable;
+}
+
+bool jpv2g_secc_get_timing_logs(void) {
+    return s_enable_timing_logs;
 }
 
 static bool looks_like_tls_client_hello(const uint8_t *buf, size_t len) {
@@ -540,7 +554,7 @@ static void secc_log_decoded_iso(jpv2g_message_type_t mtype,
         case JPV2G_PRE_CHARGE_REQ: {
             const struct iso2_PreChargeReqType *rq = (const struct iso2_PreChargeReqType *)req->body;
             if (!rb->PreChargeRes_isUsed) break;
-            JPV2G_INFO("DECODED ISO {\"msg\":\"PreCharge\",\"req\":{\"targetV\":%.1f,\"targetI\":%.1f,\"soc\":%d},\"res\":{\"responseCode\":\"%s\",\"status\":\"%s\",\"v\":%.1f}}",
+            JPV2G_WARN("DECODED ISO {\"msg\":\"PreCharge\",\"req\":{\"targetV\":%.1f,\"targetI\":%.1f,\"soc\":%d},\"res\":{\"responseCode\":\"%s\",\"status\":\"%s\",\"v\":%.1f}}",
                        secc_iso_pv_to_double(&rq->EVTargetVoltage),
                        secc_iso_pv_to_double(&rq->EVTargetCurrent),
                        (int)rq->DC_EVStatus.EVRESSSOC,
@@ -553,7 +567,7 @@ static void secc_log_decoded_iso(jpv2g_message_type_t mtype,
             const struct iso2_PowerDeliveryReqType *rq = (const struct iso2_PowerDeliveryReqType *)req->body;
             if (!rb->PowerDeliveryRes_isUsed) break;
             int charging_complete = rq->DC_EVPowerDeliveryParameter_isUsed ? rq->DC_EVPowerDeliveryParameter.ChargingComplete : -1;
-            JPV2G_INFO("DECODED ISO {\"msg\":\"PowerDelivery\",\"req\":{\"progress\":\"%s\",\"saId\":%u,\"chargingComplete\":%d},\"res\":{\"responseCode\":\"%s\",\"status\":\"%s\"}}",
+            JPV2G_WARN("DECODED ISO {\"msg\":\"PowerDelivery\",\"req\":{\"progress\":\"%s\",\"saId\":%u,\"chargingComplete\":%d},\"res\":{\"responseCode\":\"%s\",\"status\":\"%s\"}}",
                        secc_iso_charge_progress_str(rq->ChargeProgress),
                        (unsigned)rq->SAScheduleTupleID,
                        charging_complete,
@@ -570,7 +584,7 @@ static void secc_log_decoded_iso(jpv2g_message_type_t mtype,
             if (!secc_should_log_current_demand(s_iso_current_demand_loop)) break;
             const struct iso2_CurrentDemandResType *rs = &rb->CurrentDemandRes;
             int64_t wh = (rs->MeterInfo_isUsed && rs->MeterInfo.MeterReading_isUsed) ? (int64_t)rs->MeterInfo.MeterReading : -1;
-            JPV2G_INFO("DECODED ISO {\"msg\":\"CurrentDemand\",\"loop\":%u,\"req\":{\"targetV\":%.1f,\"targetI\":%.1f,\"soc\":%d,\"chargingComplete\":%d,\"bulkChargingComplete\":%d,\"remainingFullS\":%lld,\"remainingBulkS\":%lld},\"res\":{\"responseCode\":\"%s\",\"status\":\"%s\",\"v\":%.1f,\"i\":%.1f,\"wh\":%lld}}",
+            JPV2G_WARN("DECODED ISO {\"msg\":\"CurrentDemand\",\"loop\":%u,\"req\":{\"targetV\":%.1f,\"targetI\":%.1f,\"soc\":%d,\"chargingComplete\":%d,\"bulkChargingComplete\":%d,\"remainingFullS\":%lld,\"remainingBulkS\":%lld},\"res\":{\"responseCode\":\"%s\",\"status\":\"%s\",\"v\":%.1f,\"i\":%.1f,\"wh\":%lld}}",
                        (unsigned)s_iso_current_demand_loop,
                        secc_iso_pv_to_double(&rq->EVTargetVoltage),
                        secc_iso_pv_to_double(&rq->EVTargetCurrent),
@@ -1335,10 +1349,19 @@ static int jpv2g_secc_handle_stream(jpv2g_secc_t *secc,
             req_ctx.protocol = protocol;
             req_ctx.body = &app_req;
             req_log_ctx = req_ctx;
+            const int64_t handler_started_ms = jpv2g_now_monotonic_ms();
             if (secc->handle_request) {
                 handler_rc = secc->handle_request(mtype, &req_ctx, out_payload, sizeof(out_payload), &out_len, secc->user_ctx);
             } else {
                 handler_rc = jpv2g_secc_default_handle(secc, mtype, &req_ctx, out_payload, sizeof(out_payload), &out_len);
+            }
+            if (secc_timing_log_enabled(mtype)) {
+                const int64_t handler_finished_ms = jpv2g_now_monotonic_ms();
+                JPV2G_WARN("TIMING %s handler_ms=%lld out_len=%u rc=%d",
+                           secc_msg_name(mtype),
+                           (long long)(handler_finished_ms - handler_started_ms),
+                           (unsigned)out_len,
+                           handler_rc);
             }
             decoded_ok = true;
         }
@@ -1412,10 +1435,19 @@ static int jpv2g_secc_handle_stream(jpv2g_secc_t *secc,
                     req_ctx.body = decoded;
                     req_log_ctx = req_ctx;
                     req_log_ctx.body = secc_copy_req_body_for_log(req_ctx.protocol, mtype, req_ctx.body, &req_log_copy);
+                    const int64_t handler_started_ms = jpv2g_now_monotonic_ms();
                     if (secc->handle_request) {
                         handler_rc = secc->handle_request(mtype, &req_ctx, out_payload, sizeof(out_payload), &out_len, secc->user_ctx);
                     } else {
                         handler_rc = jpv2g_secc_default_handle(secc, mtype, &req_ctx, out_payload, sizeof(out_payload), &out_len);
+                    }
+                    if (secc_timing_log_enabled(mtype)) {
+                        const int64_t handler_finished_ms = jpv2g_now_monotonic_ms();
+                        JPV2G_WARN("TIMING %s handler_ms=%lld out_len=%u rc=%d",
+                                   secc_msg_name(mtype),
+                                   (long long)(handler_finished_ms - handler_started_ms),
+                                   (unsigned)out_len,
+                                   handler_rc);
                     }
                     decoded_ok = true;
                 }
@@ -1491,10 +1523,19 @@ static int jpv2g_secc_handle_stream(jpv2g_secc_t *secc,
                     req_ctx.body = decoded;
                     req_log_ctx = req_ctx;
                     req_log_ctx.body = secc_copy_req_body_for_log(req_ctx.protocol, mtype, req_ctx.body, &req_log_copy);
+                    const int64_t handler_started_ms = jpv2g_now_monotonic_ms();
                     if (secc->handle_request) {
                         handler_rc = secc->handle_request(mtype, &req_ctx, out_payload, sizeof(out_payload), &out_len, secc->user_ctx);
                     } else {
                         handler_rc = jpv2g_secc_default_handle(secc, mtype, &req_ctx, out_payload, sizeof(out_payload), &out_len);
+                    }
+                    if (secc_timing_log_enabled(mtype)) {
+                        const int64_t handler_finished_ms = jpv2g_now_monotonic_ms();
+                        JPV2G_WARN("TIMING %s handler_ms=%lld out_len=%u rc=%d",
+                                   secc_msg_name(mtype),
+                                   (long long)(handler_finished_ms - handler_started_ms),
+                                   (unsigned)out_len,
+                                   handler_rc);
                     }
                     decoded_ok = true;
                 }
@@ -1525,8 +1566,17 @@ static int jpv2g_secc_handle_stream(jpv2g_secc_t *secc,
         size_t total = 0;
         rc = jpv2g_v2gtp_build(JPV2G_PAYLOAD_EXI, out_payload, out_len, out, sizeof(out), &total);
         if (rc != 0) return rc;
+        const int64_t send_started_ms = jpv2g_now_monotonic_ms();
         ssize_t sent = send_fn(send_ctx, out, total);
+        const int64_t send_finished_ms = jpv2g_now_monotonic_ms();
         if (sent < 0 || (size_t)sent != total) return -EIO;
+        if (secc_timing_log_enabled(mtype)) {
+            JPV2G_WARN("TIMING %s send_ms=%lld total=%u sent=%lld",
+                       secc_msg_name(mtype),
+                       (long long)(send_finished_ms - send_started_ms),
+                       (unsigned)total,
+                       (long long)sent);
+        }
         JPV2G_INFO("TX %s bytes=%u", secc_msg_name(mtype), (unsigned)total);
         handled_any = true;
     }

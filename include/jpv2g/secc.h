@@ -70,6 +70,8 @@ int jpv2g_secc_handle_client_detect(jpv2g_secc_t *secc,
 /* Enable/disable verbose decoded request/response logs (enabled by default). */
 void jpv2g_secc_set_decoded_logs(bool enable);
 bool jpv2g_secc_get_decoded_logs(void);
+void jpv2g_secc_set_timing_logs(bool enable);
+bool jpv2g_secc_get_timing_logs(void);
 
 /* Default response builder (ISO/DIN) usable by custom handlers and tests. */
 int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
