@@ -310,10 +310,6 @@ static void set_din_default_payment_options(struct din_PaymentOptionsType *opts,
     init_din_PaymentOptionsType(opts);
     opts->PaymentOption.arrayLen = 0;
     opts->PaymentOption.array[opts->PaymentOption.arrayLen++] = preferred;
-    /* Always advertise at least contract as fallback for compatibility. */
-    if (preferred != din_paymentOptionType_Contract && opts->PaymentOption.arrayLen < din_paymentOptionType_2_ARRAY_SIZE) {
-        opts->PaymentOption.array[opts->PaymentOption.arrayLen++] = din_paymentOptionType_Contract;
-    }
 }
 
 static void set_din_service_tag(struct din_ServiceTagType *tag, uint16_t service_id, const char *name, din_serviceCategoryType category) {
@@ -591,6 +587,27 @@ int jpv2g_cbv2g_encode_charge_parameter_discovery_res(const uint8_t session_id[i
         set_physical_value(&res->AC_EVSEChargeParameter.EVSENominalVoltage, iso2_unitSymbolType_V, 400, 0);
         set_physical_value(&res->AC_EVSEChargeParameter.EVSEMaxCurrent, iso2_unitSymbolType_A, 32, 0);
     }
+
+    exi_bitstream_t stream;
+    exi_bitstream_init(&stream, out, out_len, 0, NULL);
+    if (encode_iso2_exiDocument(&stream, doc) != 0) return -EIO;
+    if (written) *written = exi_bitstream_get_length(&stream);
+    return 0;
+}
+
+int jpv2g_cbv2g_encode_charge_parameter_discovery_res_payload(
+    const uint8_t session_id[iso2_sessionIDType_BYTES_SIZE],
+    const struct iso2_ChargeParameterDiscoveryResType *payload,
+    uint8_t *out,
+    size_t out_len,
+    size_t *written) {
+    if (!out || !payload) return -EINVAL;
+    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    init_iso2_exiDocument(doc);
+    set_header_session(&doc->V2G_Message.Header, session_id);
+    init_iso2_BodyType(&doc->V2G_Message.Body);
+    doc->V2G_Message.Body.ChargeParameterDiscoveryRes_isUsed = 1;
+    doc->V2G_Message.Body.ChargeParameterDiscoveryRes = *payload;
 
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, out, out_len, 0, NULL);

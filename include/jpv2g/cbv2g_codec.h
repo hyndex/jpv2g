@@ -88,6 +88,12 @@ int jpv2g_cbv2g_encode_charge_parameter_discovery_res(const uint8_t session_id[i
                                                         uint8_t *out,
                                                         size_t out_len,
                                                         size_t *written);
+int jpv2g_cbv2g_encode_charge_parameter_discovery_res_payload(
+    const uint8_t session_id[iso2_sessionIDType_BYTES_SIZE],
+    const struct iso2_ChargeParameterDiscoveryResType *payload,
+    uint8_t *out,
+    size_t out_len,
+    size_t *written);
 int jpv2g_cbv2g_decode_charge_parameter_discovery_res(const uint8_t *buf, size_t len, struct iso2_ChargeParameterDiscoveryResType *res);
 
 int jpv2g_cbv2g_encode_cable_check_req(const uint8_t session_id[iso2_sessionIDType_BYTES_SIZE],

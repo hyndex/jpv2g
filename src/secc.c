@@ -650,6 +650,63 @@ static void secc_log_decoded_din(jpv2g_message_type_t mtype,
     const struct din_BodyType *rb = &res_doc.V2G_Message.Body;
 
     switch (mtype) {
+        case JPV2G_CHARGE_PARAMETER_DISCOVERY_REQ: {
+            const struct din_ChargeParameterDiscoveryReqType *rq =
+                (const struct din_ChargeParameterDiscoveryReqType *)req->body;
+            if (!rb->ChargeParameterDiscoveryRes_isUsed) break;
+            int32_t soc = rq->DC_EVChargeParameter_isUsed
+                              ? (int32_t)rq->DC_EVChargeParameter.DC_EVStatus.EVRESSSOC
+                              : -1;
+            double ev_max_i = rq->DC_EVChargeParameter_isUsed
+                                  ? secc_din_pv_to_double(&rq->DC_EVChargeParameter.EVMaximumCurrentLimit)
+                                  : 0.0;
+            double ev_max_v = rq->DC_EVChargeParameter_isUsed
+                                  ? secc_din_pv_to_double(&rq->DC_EVChargeParameter.EVMaximumVoltageLimit)
+                                  : 0.0;
+            double evse_max_i = rb->ChargeParameterDiscoveryRes.DC_EVSEChargeParameter_isUsed
+                                    ? secc_din_pv_to_double(
+                                          &rb->ChargeParameterDiscoveryRes.DC_EVSEChargeParameter.EVSEMaximumCurrentLimit)
+                                    : 0.0;
+            double evse_max_v = rb->ChargeParameterDiscoveryRes.DC_EVSEChargeParameter_isUsed
+                                    ? secc_din_pv_to_double(
+                                          &rb->ChargeParameterDiscoveryRes.DC_EVSEChargeParameter.EVSEMaximumVoltageLimit)
+                                    : 0.0;
+            double evse_max_p_kw =
+                (rb->ChargeParameterDiscoveryRes.DC_EVSEChargeParameter_isUsed &&
+                 rb->ChargeParameterDiscoveryRes.DC_EVSEChargeParameter.EVSEMaximumPowerLimit_isUsed)
+                    ? secc_din_pv_to_double(
+                          &rb->ChargeParameterDiscoveryRes.DC_EVSEChargeParameter.EVSEMaximumPowerLimit) /
+                          1000.0
+                    : 0.0;
+            JPV2G_WARN("DECODED DIN {\"msg\":\"ChargeParameterDiscovery\",\"req\":{\"evMaxA\":%.1f,"
+                       "\"evMaxV\":%.1f,\"soc\":%d},\"res\":{\"responseCode\":\"%s\",\"processing\":\"%s\","
+                       "\"status\":\"%s\",\"evseMaxA\":%.1f,\"evseMaxV\":%.1f,\"evseMaxkW\":%.1f}}",
+                        ev_max_i,
+                        ev_max_v,
+                        (int)soc,
+                        secc_din_resp_code_str(rb->ChargeParameterDiscoveryRes.ResponseCode),
+                        secc_din_proc_str(rb->ChargeParameterDiscoveryRes.EVSEProcessing),
+                        rb->ChargeParameterDiscoveryRes.DC_EVSEChargeParameter_isUsed
+                            ? secc_din_dc_status_str(
+                                  rb->ChargeParameterDiscoveryRes.DC_EVSEChargeParameter.DC_EVSEStatus.EVSEStatusCode)
+                            : "n/a",
+                        evse_max_i,
+                        evse_max_v,
+                        evse_max_p_kw);
+            break;
+        }
+        case JPV2G_CABLE_CHECK_REQ: {
+            const struct din_CableCheckReqType *rq = (const struct din_CableCheckReqType *)req->body;
+            if (!rb->CableCheckRes_isUsed) break;
+            JPV2G_WARN("DECODED DIN {\"msg\":\"CableCheck\",\"req\":{\"soc\":%d,\"evReady\":%d},"
+                       "\"res\":{\"responseCode\":\"%s\",\"processing\":\"%s\",\"status\":\"%s\"}}",
+                        (int)rq->DC_EVStatus.EVRESSSOC,
+                        rq->DC_EVStatus.EVReady ? 1 : 0,
+                        secc_din_resp_code_str(rb->CableCheckRes.ResponseCode),
+                        secc_din_proc_str(rb->CableCheckRes.EVSEProcessing),
+                        secc_din_dc_status_str(rb->CableCheckRes.DC_EVSEStatus.EVSEStatusCode));
+            break;
+        }
         case JPV2G_CURRENT_DEMAND_REQ: {
             const struct din_CurrentDemandReqType *rq = (const struct din_CurrentDemandReqType *)req->body;
             if (!rb->CurrentDemandRes_isUsed) break;
@@ -789,7 +846,7 @@ static iso2_EnergyTransferModeType secc_select_iso_etm(const jpv2g_secc_t *secc)
 
 static din_EVSESupportedEnergyTransferType secc_select_din_etm(const jpv2g_secc_t *secc) {
     (void)secc;
-    return din_EVSESupportedEnergyTransferType_DC_combo_core;
+    return din_EVSESupportedEnergyTransferType_DC_extended;
 }
 
 static bool secc_iso_etm_supported(iso2_EnergyTransferModeType etm) {
@@ -995,10 +1052,10 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
             if (req->protocol == JPV2G_PROTOCOL_DIN70121) {
                 return jpv2g_cbv2g_encode_din_service_discovery_res(sid,
                                                                      din_responseCodeType_OK,
-                                                                     din_paymentOptionType_Contract,
+                                                                     din_paymentOptionType_ExternalPayment,
                                                                      secc_select_din_etm(secc),
                                                                      1,
-                                                                     "DCFC",
+                                                                     NULL,
                                                                      free_service,
                                                                      out,
                                                                      out_len,
