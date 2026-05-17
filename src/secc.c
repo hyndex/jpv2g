@@ -1360,29 +1360,64 @@ void jpv2g_secc_stop(jpv2g_secc_t *secc) {
     jpv2g_tcp_server_stop(&secc->tls);
 }
 
+/* Per-call observation state for handle_stream. Lives on the caller's
+ * stack so the disconnect-classification helper can tell apart "EV sent
+ * an orderly SessionStopReq" from "EV resets TCP mid-CurrentDemand"
+ * even though both surface as rc=0 / rc=-ECONNRESET respectively. */
+typedef struct {
+    bool handled_any;
+    bool saw_session_stop;
+    jpv2g_message_type_t last_msg;
+} secc_stream_obs_t;
+
+static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
+                                          secc_recv_fn recv_fn,
+                                          void *recv_ctx,
+                                          secc_send_fn send_fn,
+                                          void *send_ctx,
+                                          int timeout_ms,
+                                          secc_stream_obs_t *obs);
+
 static int jpv2g_secc_handle_stream(jpv2g_secc_t *secc,
                                       secc_recv_fn recv_fn,
                                       void *recv_ctx,
                                       secc_send_fn send_fn,
                                       void *send_ctx,
                                       int timeout_ms) {
+    return jpv2g_secc_handle_stream_obs(secc, recv_fn, recv_ctx, send_fn, send_ctx, timeout_ms, NULL);
+}
+
+static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
+                                          secc_recv_fn recv_fn,
+                                          void *recv_ctx,
+                                          secc_send_fn send_fn,
+                                          void *send_ctx,
+                                          int timeout_ms,
+                                          secc_stream_obs_t *obs) {
     if (!secc || !recv_fn || !send_fn) return -EINVAL;
     uint8_t buf[JPV2G_MAX_V2GTP_SIZE];
     jpv2g_protocol_t protocol = JPV2G_PROTOCOL_UNKNOWN;
     bool handled_any = false;
+    bool saw_session_stop = false;
+    jpv2g_message_type_t last_msg = JPV2G_UNKNOWN_MESSAGE;
+    int stream_rc = 0;
+    /* Helper: write observation state and break out of the loop with the
+     * given rc. Saves us from having to touch every `return` to keep
+     * obs->* in sync with what the FSM actually saw. */
+    #define SECC_STREAM_EXIT(rc_) do { stream_rc = (rc_); goto stream_done; } while (0)
     for (;;) {
         jpv2g_v2gtp_t msg;
         int rc = secc_recv_v2gtp(recv_fn, recv_ctx, buf, sizeof(buf), &msg, timeout_ms);
         if (rc == -ETIMEDOUT) {
             if (!handled_any) {
                 JPV2G_WARN("Timeout waiting for V2GTP frame");
-                return rc;
+                SECC_STREAM_EXIT(rc);
             }
-            return 0;
+            SECC_STREAM_EXIT(0);
         }
-        if (rc == -EAGAIN) return 0; /* graceful idle exit */
-        if (rc != 0) return rc;
-        if (msg.payload_type != JPV2G_PAYLOAD_EXI) return -EBADMSG;
+        if (rc == -EAGAIN) SECC_STREAM_EXIT(0); /* graceful idle exit */
+        if (rc != 0) SECC_STREAM_EXIT(rc);
+        if (msg.payload_type != JPV2G_PAYLOAD_EXI) SECC_STREAM_EXIT(-EBADMSG);
         jpv2g_message_type_t mtype = JPV2G_UNKNOWN_MESSAGE;
         uint8_t out_payload[JPV2G_MAX_EXI_SIZE];
         size_t out_len = 0;
@@ -1601,32 +1636,38 @@ static int jpv2g_secc_handle_stream(jpv2g_secc_t *secc,
 
         if (mtype == JPV2G_UNKNOWN_MESSAGE) {
             /* Fallback: echo */
-            if (msg.payload_length > sizeof(out_payload)) return -ENOSPC;
+            if (msg.payload_length > sizeof(out_payload)) SECC_STREAM_EXIT(-ENOSPC);
             memcpy(out_payload, msg.payload, msg.payload_length);
             out_len = msg.payload_length;
         }
 
         if (!decoded_ok) {
             JPV2G_WARN("Failed to decode EXI message (payload_len=%u)", (unsigned)msg.payload_length);
-            return -EBADMSG;
+            SECC_STREAM_EXIT(-EBADMSG);
         }
         JPV2G_INFO("RX %s (proto=%d)", secc_msg_name(mtype), (int)req_ctx.protocol);
         secc_log_exi_hex("RX", mtype, msg.payload, msg.payload_length);
         if (handler_rc != 0) {
             JPV2G_WARN("Handler failed for %s rc=%d", secc_msg_name(mtype), handler_rc);
-            return handler_rc;
+            SECC_STREAM_EXIT(handler_rc);
         }
-        if (out_len == 0) return -EIO;
+        if (out_len == 0) SECC_STREAM_EXIT(-EIO);
         secc_log_decoded_transaction(mtype, &req_log_ctx, out_payload, out_len);
         secc_log_exi_hex("TX", mtype, out_payload, out_len);
         uint8_t out[JPV2G_V2GTP_HEADER_LEN + JPV2G_MAX_EXI_SIZE];
         size_t total = 0;
         rc = jpv2g_v2gtp_build(JPV2G_PAYLOAD_EXI, out_payload, out_len, out, sizeof(out), &total);
-        if (rc != 0) return rc;
+        if (rc != 0) SECC_STREAM_EXIT(rc);
         const int64_t send_started_ms = jpv2g_now_monotonic_ms();
         ssize_t sent = send_fn(send_ctx, out, total);
         const int64_t send_finished_ms = jpv2g_now_monotonic_ms();
-        if (sent < 0 || (size_t)sent != total) return -EIO;
+        if (sent < 0 || (size_t)sent != total) SECC_STREAM_EXIT(-EIO);
+        if (mtype != JPV2G_UNKNOWN_MESSAGE) {
+            last_msg = mtype;
+            if (mtype == JPV2G_SESSION_STOP_REQ) {
+                saw_session_stop = true;
+            }
+        }
         if (secc_timing_log_enabled(mtype)) {
             JPV2G_WARN("TIMING %s send_ms=%lld total=%u sent=%lld",
                        secc_msg_name(mtype),
@@ -1636,7 +1677,22 @@ static int jpv2g_secc_handle_stream(jpv2g_secc_t *secc,
         }
         JPV2G_INFO("TX %s bytes=%u", secc_msg_name(mtype), (unsigned)total);
         handled_any = true;
+        /* SessionStopRes was sent successfully: do not keep the stream open
+         * waiting for more messages. The EV typically closes the socket
+         * immediately after this, and waiting for the idle timeout would
+         * keep the worker pinned on a dead session for tens of seconds. */
+        if (saw_session_stop) {
+            SECC_STREAM_EXIT(0);
+        }
     }
+stream_done:
+    if (obs) {
+        obs->handled_any = handled_any;
+        obs->saw_session_stop = saw_session_stop;
+        obs->last_msg = last_msg;
+    }
+    #undef SECC_STREAM_EXIT
+    return stream_rc;
 }
 
 int jpv2g_secc_handle_client(jpv2g_secc_t *secc, int client_fd, int timeout_ms) {
@@ -1670,27 +1726,139 @@ int jpv2g_secc_handle_client_detect(jpv2g_secc_t *secc,
                                       int client_fd,
                                       int first_timeout_ms,
                                       int timeout_ms) {
-    if (!secc || client_fd < 0) return -EINVAL;
+    return jpv2g_secc_handle_client_detect_ex(secc, client_fd, first_timeout_ms, timeout_ms, NULL, NULL);
+}
+
+int jpv2g_secc_handle_client_detect_ex(jpv2g_secc_t *secc,
+                                        int client_fd,
+                                        int first_timeout_ms,
+                                        int timeout_ms,
+                                        jpv2g_hlc_drop_reason_t *out_reason,
+                                        bool *out_saw_session_stop) {
+    if (out_reason) {
+        *out_reason = JPV2G_HLC_DROP_UNKNOWN;
+    }
+    if (out_saw_session_stop) {
+        *out_saw_session_stop = false;
+    }
+    if (!secc || client_fd < 0) {
+        if (out_reason) {
+            *out_reason = JPV2G_HLC_DROP_INVALID_ARG;
+        }
+        return -EINVAL;
+    }
     int wait_ms = first_timeout_ms > 0 ? first_timeout_ms : JPV2G_TIMEOUT_FIRST_HLC;
     uint8_t peek[JPV2G_V2GTP_HEADER_LEN] = {0};
     int r = peek_first_bytes(client_fd, peek, sizeof(peek), wait_ms);
     if (r < 0) {
         if (r == -ETIMEDOUT) {
             JPV2G_WARN("No HLC bytes received within %d ms", wait_ms);
+            if (out_reason) {
+                *out_reason = JPV2G_HLC_DROP_FIRST_PACKET_TIMEOUT;
+            }
+        } else if (r == -ECONNRESET) {
+            JPV2G_WARN("Peer closed before sending any HLC bytes");
+            if (out_reason) {
+                *out_reason = JPV2G_HLC_DROP_PEER_RESET;
+            }
         } else {
             JPV2G_WARN("Failed to peek incoming HLC bytes (%d)", r);
+            if (out_reason) {
+                *out_reason = JPV2G_HLC_DROP_TCP_RECV_FAIL;
+            }
         }
         return r;
     }
     bool tls = looks_like_tls_client_hello(peek, (size_t)r);
     bool v2g = looks_like_v2gtp_header(peek, (size_t)r);
+    int rc;
+    secc_stream_obs_t obs = {0};
+    obs.last_msg = JPV2G_UNKNOWN_MESSAGE;
     if (tls) {
         JPV2G_INFO("Detected TLS ClientHello; switching to TLS handler");
-        return jpv2g_secc_handle_client_tls(secc, client_fd, NULL, NULL, NULL, timeout_ms);
+        /* TLS path still uses the plain handle_client_tls — populating obs
+         * across the TLS handshake would require additional plumbing.
+         * Fall back to the legacy "unclassified" reason; callers can
+         * still inspect rc directly. */
+        rc = jpv2g_secc_handle_client_tls(secc, client_fd, NULL, NULL, NULL, timeout_ms);
+        if (out_reason) {
+            *out_reason = jpv2g_secc_classify_disconnect(rc, false, false);
+        }
+        return rc;
     }
     if (!v2g) {
         JPV2G_WARN("Unknown HLC prefix (0x%02X 0x%02X ... len=%d); treating as plaintext V2GTP",
                    peek[0], (r > 1) ? peek[1] : 0, r);
     }
-    return jpv2g_secc_handle_client(secc, client_fd, timeout_ms);
+    rc = jpv2g_secc_handle_stream_obs(secc, secc_recv_tcp, &client_fd, secc_send_tcp, &client_fd, timeout_ms, &obs);
+    if (out_reason) {
+        *out_reason = jpv2g_secc_classify_disconnect(rc, obs.handled_any, obs.saw_session_stop);
+    }
+    if (out_saw_session_stop) {
+        *out_saw_session_stop = obs.saw_session_stop;
+    }
+    JPV2G_INFO("HLC session done rc=%d reason=%s last_msg=%s handled_any=%d saw_session_stop=%d",
+               rc,
+               jpv2g_hlc_drop_reason_name(out_reason ? *out_reason
+                                                    : jpv2g_secc_classify_disconnect(rc, obs.handled_any, obs.saw_session_stop)),
+               secc_msg_name(obs.last_msg),
+               obs.handled_any ? 1 : 0,
+               obs.saw_session_stop ? 1 : 0);
+    return rc;
+}
+
+const char *jpv2g_hlc_drop_reason_name(jpv2g_hlc_drop_reason_t reason) {
+    switch (reason) {
+        case JPV2G_HLC_DROP_FIRST_PACKET_TIMEOUT: return "FirstPacketTimeout";
+        case JPV2G_HLC_DROP_IDLE_TIMEOUT:         return "IdleTimeout";
+        case JPV2G_HLC_DROP_PEER_RESET:           return "PeerReset";
+        case JPV2G_HLC_DROP_EV_SESSION_STOP:      return "EvSessionStop";
+        case JPV2G_HLC_DROP_TCP_RECV_FAIL:        return "TcpRecvFail";
+        case JPV2G_HLC_DROP_TCP_SEND_FAIL:        return "TcpSendFail";
+        case JPV2G_HLC_DROP_CODEC_ERROR:          return "CodecError";
+        case JPV2G_HLC_DROP_HANDLER_ERROR:        return "HandlerError";
+        case JPV2G_HLC_DROP_LOCAL_STOP:           return "LocalStop";
+        case JPV2G_HLC_DROP_INVALID_ARG:          return "InvalidArg";
+        case JPV2G_HLC_DROP_UNKNOWN:
+        default:                                   return "Unknown";
+    }
+}
+
+jpv2g_hlc_drop_reason_t jpv2g_secc_classify_disconnect(int rc,
+                                                       bool handled_any,
+                                                       bool saw_session_stop) {
+    if (rc == 0) {
+        if (saw_session_stop) {
+            return JPV2G_HLC_DROP_EV_SESSION_STOP;
+        }
+        /* rc==0 without SessionStop means the recv loop returned cleanly
+         * after handling at least one message and then hit EAGAIN/idle.
+         * Treat that as an idle timeout for the diagnostic, since the
+         * peer effectively stopped responding without telling us why. */
+        return JPV2G_HLC_DROP_IDLE_TIMEOUT;
+    }
+    if (rc == -ETIMEDOUT) {
+        return handled_any ? JPV2G_HLC_DROP_IDLE_TIMEOUT : JPV2G_HLC_DROP_FIRST_PACKET_TIMEOUT;
+    }
+    if (rc == -ECONNRESET) {
+        return JPV2G_HLC_DROP_PEER_RESET;
+    }
+    if (rc == -EBADMSG || rc == -ENOSPC || rc == -E2BIG) {
+        return JPV2G_HLC_DROP_CODEC_ERROR;
+    }
+    if (rc == -EIO) {
+        /* recv_bytes does not currently produce -EIO; the only call site
+         * that returns it is the v2gtp send path or out_len==0 fallthrough.
+         * Both indicate an outbound failure, so report TCP send-fail. */
+        return JPV2G_HLC_DROP_TCP_SEND_FAIL;
+    }
+    if (rc == -EINVAL) {
+        return JPV2G_HLC_DROP_INVALID_ARG;
+    }
+    if (rc > 0) {
+        /* A handler returned a positive sentinel; fold into HandlerError.
+         * Negative non-errno values get the same treatment. */
+        return JPV2G_HLC_DROP_HANDLER_ERROR;
+    }
+    return JPV2G_HLC_DROP_TCP_RECV_FAIL;
 }

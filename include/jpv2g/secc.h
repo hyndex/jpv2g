@@ -30,6 +30,52 @@ typedef struct {
     const void *body;                                /* Decoded request body */
 } jpv2g_secc_request_t;
 
+/* Classification of why a HLC client session ended. The PLC HLC worker
+ * branches on this to decide power-path policy: a clean SESSION_STOP can
+ * follow a relaxed teardown, an EV TCP reset during active charging
+ * must drop current to 0 A immediately, and codec/parse errors imply
+ * a stack incompatibility worth surfacing rather than blindly retrying.
+ *
+ * The numeric values are part of the diagnostic log output; do NOT
+ * renumber existing entries.
+ */
+typedef enum {
+    JPV2G_HLC_DROP_UNKNOWN = 0,
+    JPV2G_HLC_DROP_FIRST_PACKET_TIMEOUT = 1,  /* peer never spoke within first_timeout_ms */
+    JPV2G_HLC_DROP_IDLE_TIMEOUT = 2,          /* idle timeout between messages */
+    JPV2G_HLC_DROP_PEER_RESET = 3,            /* TCP RST / orderly close (recv returned 0) */
+    JPV2G_HLC_DROP_EV_SESSION_STOP = 4,       /* EV sent SessionStopReq before disconnect */
+    JPV2G_HLC_DROP_TCP_RECV_FAIL = 5,         /* socket recv() failed with a non-timeout errno */
+    JPV2G_HLC_DROP_TCP_SEND_FAIL = 6,         /* socket send() failed or short-wrote */
+    JPV2G_HLC_DROP_CODEC_ERROR = 7,           /* EXI/V2GTP parse rejected */
+    JPV2G_HLC_DROP_HANDLER_ERROR = 8,         /* downstream response handler returned non-zero */
+    JPV2G_HLC_DROP_LOCAL_STOP = 9,            /* local code closed the socket */
+    JPV2G_HLC_DROP_INVALID_ARG = 10,          /* misuse of the API */
+} jpv2g_hlc_drop_reason_t;
+
+/* Map a rc returned from jpv2g_secc_handle_client_detect() (or the
+ * underlying handle_stream) to a jpv2g_hlc_drop_reason_t. The mapping
+ * uses POSIX errno semantics:
+ *   rc == 0               -> JPV2G_HLC_DROP_EV_SESSION_STOP if a stop
+ *                            message was observed, otherwise IDLE_TIMEOUT
+ *   rc == -ETIMEDOUT      -> IDLE_TIMEOUT (or FIRST_PACKET_TIMEOUT if
+ *                            no message was handled before the timeout)
+ *   rc == -ECONNRESET     -> PEER_RESET
+ *   rc == -EIO            -> TCP_SEND_FAIL
+ *   rc == -EBADMSG/-E2BIG -> CODEC_ERROR
+ *   rc == -EINVAL         -> INVALID_ARG
+ *   anything else negative-> TCP_RECV_FAIL (catch-all socket-level error)
+ *
+ * `handled_any` reflects whether at least one HLC request was processed
+ * before the disconnect; `saw_session_stop` reflects whether the EV's
+ * SessionStopReq passed through the handler. Both are surfaced from the
+ * caller because the rc value alone cannot distinguish these cases.
+ */
+const char *jpv2g_hlc_drop_reason_name(jpv2g_hlc_drop_reason_t reason);
+jpv2g_hlc_drop_reason_t jpv2g_secc_classify_disconnect(int rc,
+                                                       bool handled_any,
+                                                       bool saw_session_stop);
+
 typedef struct {
     jpv2g_secc_config_t cfg;
     jpv2g_codec_ctx *codec;
@@ -66,6 +112,16 @@ int jpv2g_secc_handle_client_detect(jpv2g_secc_t *secc,
                                       int client_fd,
                                       int first_timeout_ms,
                                       int timeout_ms);
+
+/* Extended variant that also reports a classified disconnect reason
+ * via the out-pointer. The rc return value is unchanged. Both pointers
+ * are optional. */
+int jpv2g_secc_handle_client_detect_ex(jpv2g_secc_t *secc,
+                                        int client_fd,
+                                        int first_timeout_ms,
+                                        int timeout_ms,
+                                        jpv2g_hlc_drop_reason_t *out_reason,
+                                        bool *out_saw_session_stop);
 
 /* Enable/disable verbose decoded request/response logs (enabled by default). */
 void jpv2g_secc_set_decoded_logs(bool enable);
