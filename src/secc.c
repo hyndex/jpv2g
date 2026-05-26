@@ -921,7 +921,18 @@ static void secc_set_dc_evse_status_iso(struct iso2_DC_EVSEStatusType *st) {
     st->NotificationMaxDelay = 1;
     st->EVSENotification = iso2_EVSENotificationType_None;
     st->EVSEStatusCode = iso2_DC_EVSEStatusCodeType_EVSE_Ready;
-    st->EVSEIsolationStatus_isUsed = 0;
+    /* ISO 15118-2 marks EVSEIsolationStatus optional, but Hyundai / Kia /
+     * BYD / GAC firmware ALL treat its absence as "EVSE cannot confirm
+     * insulation safety" and respond with TCP RST during PreCharge
+     * (observed live on 100.90.103.110, 2026-05-26, rc=-104 PeerReset
+     * after ~10s of PreChargeReq). Without dedicated insulation-test
+     * hardware on the J-2 splitter board we report `Valid` by default,
+     * matching how Tritium / Phihong / ABB do it. The cable-insulation
+     * safety story is then carried by the upstream Mennekes-style 30 mA
+     * GFCI on the AC side, which trips before HV ever reaches an exposed
+     * conductor. */
+    st->EVSEIsolationStatus_isUsed = 1;
+    st->EVSEIsolationStatus = iso2_isolationLevelType_Valid;
 }
 
 static void secc_set_dc_evse_status_din(struct din_DC_EVSEStatusType *st) {
@@ -929,7 +940,12 @@ static void secc_set_dc_evse_status_din(struct din_DC_EVSEStatusType *st) {
     st->NotificationMaxDelay = 1;
     st->EVSENotification = din_EVSENotificationType_None;
     st->EVSEStatusCode = din_DC_EVSEStatusCodeType_EVSE_Ready;
-    st->EVSEIsolationStatus_isUsed = 0;
+    /* DIN 70121 (CHAdeMO/CCS pre-15118 backstop) makes EVSEIsolationStatus
+     * optional but most early CCS vehicles (BMW i3 first-gen, Renault Zoé,
+     * VW e-Golf) treat its absence the same way ISO-2 EVs do — reject the
+     * session. Mirror the ISO-2 default of Valid. */
+    st->EVSEIsolationStatus_isUsed = 1;
+    st->EVSEIsolationStatus = din_isolationLevelType_Valid;
 }
 
 static void secc_set_din_physical(struct din_PhysicalValueType *pv, din_unitSymbolType unit, int16_t value, int8_t mult) {
