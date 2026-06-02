@@ -169,9 +169,12 @@ public:
         poll_ingress();
     }
 
-    IOResult read(uint8_t* buffer, int timeout_ms) override {
+    IOResult read(uint8_t* buffer, int timeout_ms, size_t* out_len) override {
         if (!ready) {
             last_error = "transport not ready";
+            if (out_len) {
+                *out_len = 0u;
+            }
             return IOResult::Failure;
         }
 
@@ -181,12 +184,18 @@ public:
             if (pop_frame(frame)) {
                 memset(buffer, 0, ETH_FRAME_LEN);
                 memcpy(buffer, frame.data.data(), frame.len);
+                if (out_len) {
+                    *out_len = static_cast<size_t>(frame.len);
+                }
                 return IOResult::Ok;
             }
 
             poll_ingress();
 
             if (timeout_ms >= 0 && (uint32_t)(millis() - start_ms) >= static_cast<uint32_t>(timeout_ms)) {
+                if (out_len) {
+                    *out_len = 0u;
+                }
                 return IOResult::Timeout;
             }
             delay(1);
