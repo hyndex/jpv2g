@@ -227,6 +227,49 @@ static bool secc_din_cap_precharge_current(struct din_PreChargeReqType *rq) {
     return true;
 }
 
+/* Default-handler echo clamps.
+ *
+ * The built-in PreCharge / CurrentDemand handlers below echo the
+ * EV-REQUESTED target voltage/current straight back as
+ * EVSEPresentVoltage / EVSEPresentCurrent. Production firmware overrides
+ * these handlers with real telemetry, but for direct library consumers
+ * (examples, bench tools, a host that forgets to install a handler) the
+ * unclamped echo is a footgun: a confused or hostile EV can make the
+ * default SECC "report" a present voltage/current far beyond anything
+ * the EVSE ever offered, and downstream logic keying off the reported
+ * values inherits the lie.
+ *
+ * Clamp the echo to the maxima this stack advertises in
+ * ChargeParameterDiscoveryRes (EVSEMaximumVoltageLimit = 1000 V,
+ * EVSEMaximumCurrentLimit = 200 A — see the default DC charge parameters
+ * in cbv2g_codec.c). The secc config struct carries no per-install
+ * limits, so the advertised defaults are the tightest bound available
+ * here. Clamp only; no other restructuring of the default handlers.
+ */
+#define SECC_ECHO_MAX_VOLTAGE_V 1000
+#define SECC_ECHO_MAX_CURRENT_A 200
+
+static void secc_iso_clamp_echo_pv(struct iso2_PhysicalValueType *pv,
+                                   iso2_unitSymbolType unit,
+                                   int16_t max_value) {
+    if (!pv) return;
+    if (secc_iso_pv_to_double(pv) <= (double)max_value) return;
+    pv->Multiplier = 0;
+    pv->Unit = unit;
+    pv->Value = max_value;
+}
+
+static void secc_din_clamp_echo_pv(struct din_PhysicalValueType *pv,
+                                   din_unitSymbolType unit,
+                                   int16_t max_value) {
+    if (!pv) return;
+    if (secc_din_pv_to_double(pv) <= (double)max_value) return;
+    pv->Multiplier = 0;
+    pv->Unit_isUsed = 1;
+    pv->Unit = unit;
+    pv->Value = max_value;
+}
+
 static int64_t secc_iso_pv_or_neg1(const struct iso2_PhysicalValueType *pv, unsigned used) {
     if (!pv || !used) return -1;
     return (int64_t)secc_iso_pv_to_double(pv);
@@ -1167,6 +1210,8 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
                         JPV2G_INFO("PreCharge current limited to 2.0A (DIN)");
                     }
                     res.EVSEPresentVoltage = rq_eff.EVTargetVoltage;
+                    secc_din_clamp_echo_pv(&res.EVSEPresentVoltage, din_unitSymbolType_V,
+                                           SECC_ECHO_MAX_VOLTAGE_V);
                 } else {
                     secc_set_din_physical(&res.EVSEPresentVoltage, din_unitSymbolType_V, 400, 0);
                 }
@@ -1182,6 +1227,8 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
                     JPV2G_INFO("PreCharge current limited to 2.0A (ISO)");
                 }
                 res.EVSEPresentVoltage = rq_eff.EVTargetVoltage;
+                secc_iso_clamp_echo_pv(&res.EVSEPresentVoltage, iso2_unitSymbolType_V,
+                                       SECC_ECHO_MAX_VOLTAGE_V);
             } else {
                 res.EVSEPresentVoltage.Unit = iso2_unitSymbolType_V;
                 res.EVSEPresentVoltage.Value = 400;
@@ -1207,6 +1254,10 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
                     const struct din_CurrentDemandReqType *rq = (const struct din_CurrentDemandReqType *)req->body;
                     res.EVSEPresentVoltage = rq->EVTargetVoltage;
                     res.EVSEPresentCurrent = rq->EVTargetCurrent;
+                    secc_din_clamp_echo_pv(&res.EVSEPresentVoltage, din_unitSymbolType_V,
+                                           SECC_ECHO_MAX_VOLTAGE_V);
+                    secc_din_clamp_echo_pv(&res.EVSEPresentCurrent, din_unitSymbolType_A,
+                                           SECC_ECHO_MAX_CURRENT_A);
                 } else {
                     secc_set_din_physical(&res.EVSEPresentVoltage, din_unitSymbolType_V, 400, 0);
                     secc_set_din_physical(&res.EVSEPresentCurrent, din_unitSymbolType_A, 16, 0);
@@ -1224,6 +1275,10 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
                 const struct iso2_CurrentDemandReqType *rq = (const struct iso2_CurrentDemandReqType *)req->body;
                 res.EVSEPresentVoltage = rq->EVTargetVoltage;
                 res.EVSEPresentCurrent = rq->EVTargetCurrent;
+                secc_iso_clamp_echo_pv(&res.EVSEPresentVoltage, iso2_unitSymbolType_V,
+                                       SECC_ECHO_MAX_VOLTAGE_V);
+                secc_iso_clamp_echo_pv(&res.EVSEPresentCurrent, iso2_unitSymbolType_A,
+                                       SECC_ECHO_MAX_CURRENT_A);
             } else {
                 res.EVSEPresentVoltage.Unit = iso2_unitSymbolType_V;
                 res.EVSEPresentVoltage.Value = 400;
