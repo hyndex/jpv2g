@@ -21,16 +21,60 @@
 #include "cbv2g/iso_2/iso2_msgDefEncoder.h"
 #include "jpv2g/byte_utils.h"
 
+#include <stdlib.h>
 #if defined(ESP_PLATFORM)
-#include <esp_attr.h>
-#endif
-#ifndef EXT_RAM_ATTR
-#define EXT_RAM_ATTR
+#include <esp_heap_caps.h>
 #endif
 
-static EXT_RAM_ATTR struct appHand_exiDocument g_app_doc_psram;
-static EXT_RAM_ATTR struct iso2_exiDocument g_iso_doc_psram;
-static EXT_RAM_ATTR struct din_exiDocument g_din_doc_psram;
+// The ISO-15118 / DIN / app message documents are large (iso2 ~24 KB, din ~11 KB,
+// app ~0.6 KB). They were declared EXT_RAM_ATTR to live in PSRAM, but the
+// precompiled Arduino SDK does not enable BSS-in-PSRAM
+// (CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is off), so EXT_RAM_ATTR silently
+// fell back to internal .dram0.bss — pinning ~35 KB of scarce internal SRAM. We
+// instead allocate them from PSRAM at RUNTIME (PSRAM-first with an internal
+// fallback, so a board without PSRAM still works), realizing the intended
+// placement and freeing ~35 KB of internal SRAM. Allocated lazily on first use
+// (callers need no init) and optionally pre-warmed at boot by
+// jpv2g_cbv2g_codec_init(). Allocated once, reused for every message, never freed
+// (process-lifetime) — so no fragmentation.
+static struct appHand_exiDocument *g_app_doc_psram = NULL;
+static struct iso2_exiDocument *g_iso_doc_psram = NULL;
+static struct din_exiDocument *g_din_doc_psram = NULL;
+
+// PSRAM-first, internal fallback. Zeroed (calloc) so a fresh document starts clean.
+static void *jpv2g_doc_alloc(size_t sz) {
+#if defined(ESP_PLATFORM)
+    void *p = heap_caps_calloc(1, sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) p = heap_caps_calloc(1, sz, MALLOC_CAP_8BIT);   // no PSRAM → internal
+    return p;
+#else
+    return calloc(1, sz);
+#endif
+}
+
+static struct appHand_exiDocument *app_doc(void) {
+    if (!g_app_doc_psram) g_app_doc_psram = jpv2g_doc_alloc(sizeof(*g_app_doc_psram));
+    return g_app_doc_psram;
+}
+static struct iso2_exiDocument *iso_doc(void) {
+    if (!g_iso_doc_psram) g_iso_doc_psram = jpv2g_doc_alloc(sizeof(*g_iso_doc_psram));
+    return g_iso_doc_psram;
+}
+static struct din_exiDocument *din_doc(void) {
+    if (!g_din_doc_psram) g_din_doc_psram = jpv2g_doc_alloc(sizeof(*g_din_doc_psram));
+    return g_din_doc_psram;
+}
+
+// Optional: pre-allocate the documents at boot (off the HLC timing path) instead
+// of lazily on the first V2G message. Safe to call more than once.
+void jpv2g_cbv2g_codec_init(void) { (void)app_doc(); (void)iso_doc(); (void)din_doc(); }
+
+// True once all three documents are allocated. The HLC bring-up gates on this so
+// a heap-starved allocation surfaces as a clean init failure (with backoff and a
+// structured fault) instead of a NULL deref on the first V2G message.
+bool jpv2g_cbv2g_codec_ready(void) {
+    return g_app_doc_psram != NULL && g_iso_doc_psram != NULL && g_din_doc_psram != NULL;
+}
 
 static uint16_t copy_chars(char *dst, size_t dst_size, const char *src) {
     if (!dst || !dst_size) return 0;
@@ -64,7 +108,7 @@ int jpv2g_cbv2g_encode_sapp_req(const char *ns,
                                   size_t out_len,
                                   size_t *written) {
     if (!ns || !out) return -EINVAL;
-    struct appHand_exiDocument *doc = &g_app_doc_psram;
+    struct appHand_exiDocument *doc = app_doc();
     init_appHand_exiDocument(doc);
     doc->supportedAppProtocolReq_isUsed = 1;
     init_appHand_supportedAppProtocolReq(&doc->supportedAppProtocolReq);
@@ -88,7 +132,7 @@ int jpv2g_cbv2g_encode_sapp_req(const char *ns,
 
 int jpv2g_cbv2g_decode_sapp_res(const uint8_t *buf, size_t len, struct appHand_supportedAppProtocolRes *res) {
     if (!buf || !res) return -EINVAL;
-    struct appHand_exiDocument *doc = &g_app_doc_psram;
+    struct appHand_exiDocument *doc = app_doc();
     init_appHand_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -104,7 +148,7 @@ int jpv2g_cbv2g_encode_sapp_res(uint8_t schema_id,
                                   size_t out_len,
                                   size_t *written) {
     if (!out) return -EINVAL;
-    struct appHand_exiDocument *doc = &g_app_doc_psram;
+    struct appHand_exiDocument *doc = app_doc();
     init_appHand_exiDocument(doc);
     doc->supportedAppProtocolRes_isUsed = 1;
     init_appHand_supportedAppProtocolRes(&doc->supportedAppProtocolRes);
@@ -123,7 +167,7 @@ int jpv2g_cbv2g_encode_session_setup_req(const uint8_t evcc_id[iso2_evccIDType_B
                                            size_t out_len,
                                            size_t *written) {
     if (!evcc_id || !out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     init_iso2_MessageHeaderType(&doc->V2G_Message.Header);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -142,7 +186,7 @@ int jpv2g_cbv2g_encode_session_setup_req(const uint8_t evcc_id[iso2_evccIDType_B
 
 int jpv2g_cbv2g_decode_session_setup_req(const uint8_t *buf, size_t len, struct iso2_SessionSetupReqType *req) {
     if (!buf || !req) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -159,7 +203,7 @@ int jpv2g_cbv2g_encode_session_setup_res(const uint8_t session_id[iso2_sessionID
                                            size_t out_len,
                                            size_t *written) {
     if (!session_id || !evse_id || !out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     init_iso2_MessageHeaderType(&doc->V2G_Message.Header);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -182,7 +226,7 @@ int jpv2g_cbv2g_encode_session_setup_res(const uint8_t session_id[iso2_sessionID
 
 int jpv2g_cbv2g_decode_session_setup_res(const uint8_t *buf, size_t len, struct iso2_SessionSetupResType *res, uint8_t session_id_out[iso2_sessionIDType_BYTES_SIZE]) {
     if (!buf || !res || !session_id_out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -262,6 +306,50 @@ static void set_default_iso_sa_schedule(struct iso2_ChargeParameterDiscoveryResT
     set_physical_value(&entry->PMax, iso2_unitSymbolType_W, 60, 3);
 }
 
+// DIN 70121 ChargeParameterDiscoveryRes REQUIRES a SAScheduleList when
+// EVSEProcessing=Finished. The pre-fix DIN encoder declared Finished but never
+// populated the schedule, so DIN-strict EVs (Mahindra XUV 9e, and others)
+// rejected the response and TCP-reset (PeerReset) at ChargeParameterDiscovery,
+// never reaching CableCheck — i.e. never charging — while ISO 15118-2 EVs
+// charged fine (the ISO encoder always set its SAScheduleList, above). This
+// mirrors that helper for DIN.
+//
+// DIN PMax is a raw int16 (Watts; schema max 32767) with NO PhysicalValue
+// multiplier, so it cannot express a DC charger's full power. That is by DIN
+// design: the real DC limit is carried by DC_EVSEChargeParameter
+// (EVSEMaximumPowerLimit/Current/Voltage), and DC EVs gate on those, not on the
+// legacy AC-era schedule PMax. We advertise the schema max here = "no
+// schedule-imposed cap".
+static void set_default_din_sa_schedule(struct din_ChargeParameterDiscoveryResType *res) {
+    if (!res) return;
+    res->SASchedules_isUsed = 0;
+    res->SAScheduleList_isUsed = 1;
+    init_din_SAScheduleListType(&res->SAScheduleList);
+    res->SAScheduleList.SAScheduleTuple.arrayLen = 1;
+    struct din_SAScheduleTupleType *tuple = &res->SAScheduleList.SAScheduleTuple.array[0];
+    init_din_SAScheduleTupleType(tuple);
+    tuple->SAScheduleTupleID = 1;
+    tuple->SalesTariff_isUsed = 0;
+
+    init_din_PMaxScheduleType(&tuple->PMaxSchedule);
+    // PMaxScheduleID is a DIN-70121-ONLY mandatory field (1:1, no _isUsed) that
+    // ISO 15118-2's PMaxScheduleType does NOT have — so the ISO-mirrored helper
+    // omitted it. Left uninitialized it is garbage, which malforms the EXI and
+    // corrupts the shared din_doc() encode buffer (breaking even the next/earlier
+    // message). Must be a valid SAID; 1 matches SAScheduleTupleID.
+    tuple->PMaxSchedule.PMaxScheduleID = 1;
+    tuple->PMaxSchedule.PMaxScheduleEntry.arrayLen = 1;
+    struct din_PMaxScheduleEntryType *entry = &tuple->PMaxSchedule.PMaxScheduleEntry.array[0];
+    init_din_PMaxScheduleEntryType(entry);
+    init_din_RelativeTimeIntervalType(&entry->RelativeTimeInterval);
+    entry->RelativeTimeInterval.start = 0;
+    entry->RelativeTimeInterval.duration = 24U * 3600U;
+    entry->RelativeTimeInterval.duration_isUsed = 1;
+    entry->RelativeTimeInterval_isUsed = 1;
+    entry->TimeInterval_isUsed = 0;
+    entry->PMax = 32767; // int16 schema max; real DC limit is in DC_EVSEChargeParameter
+}
+
 static bool iso_etm_is_dc(iso2_EnergyTransferModeType etm) {
     return etm == iso2_EnergyTransferModeType_DC_core ||
            etm == iso2_EnergyTransferModeType_DC_extended ||
@@ -294,7 +382,15 @@ static void set_din_default_dc_evse_status(struct din_DC_EVSEStatusType *status)
     status->NotificationMaxDelay = 1;
     status->EVSENotification = din_EVSENotificationType_None;
     status->EVSEStatusCode = din_DC_EVSEStatusCodeType_EVSE_Ready;
-    status->EVSEIsolationStatus_isUsed = 0;
+    // DIN isolation fix (2026-06-21 V2G audit): every DIN DC response that falls through
+    // to this default (CableCheck, PowerDelivery, WeldingDetection) previously left
+    // EVSEIsolationStatus ABSENT from the EXI (isUsed=0). Isolation-rejecting EVCCs
+    // (Hyundai/Kia/BYD/GAC/MG/early-CCS) treat a missing EVSEIsolationStatus as
+    // "insulation not confirmed" and abort at CableCheck (~20s -> SessionStop -> retry).
+    // Mirror the ISO2 default (set_default_dc_evse_status above) and the DIN PreCharge/
+    // CurrentDemand helper (secc_set_dc_evse_status_din): always present + Valid.
+    status->EVSEIsolationStatus_isUsed = 1;
+    status->EVSEIsolationStatus = din_isolationLevelType_Valid;
 }
 
 static void set_din_default_ac_status(struct din_AC_EVSEStatusType *status) {
@@ -354,7 +450,7 @@ static void set_bytes_field(uint8_t *dst, uint16_t *len_field, size_t max, const
 
 int jpv2g_cbv2g_encode_service_discovery_req(const uint8_t session_id[iso2_sessionIDType_BYTES_SIZE], uint8_t *out, size_t out_len, size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -369,7 +465,7 @@ int jpv2g_cbv2g_encode_service_discovery_req(const uint8_t session_id[iso2_sessi
 
 int jpv2g_cbv2g_decode_service_discovery_req(const uint8_t *buf, size_t len, struct iso2_ServiceDiscoveryReqType *req) {
     if (!buf || !req) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -390,7 +486,7 @@ int jpv2g_cbv2g_encode_service_discovery_res(const uint8_t session_id[iso2_sessi
                                                size_t out_len,
                                                size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -427,7 +523,7 @@ int jpv2g_cbv2g_encode_service_discovery_res(const uint8_t session_id[iso2_sessi
 
 int jpv2g_cbv2g_decode_service_discovery_res(const uint8_t *buf, size_t len, struct iso2_ServiceDiscoveryResType *res) {
     if (!buf || !res) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -443,7 +539,7 @@ int jpv2g_cbv2g_encode_payment_service_selection_req(const uint8_t session_id[is
                                                        size_t out_len,
                                                        size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -464,7 +560,7 @@ int jpv2g_cbv2g_encode_payment_service_selection_req(const uint8_t session_id[is
 
 int jpv2g_cbv2g_decode_payment_service_selection_req(const uint8_t *buf, size_t len, struct iso2_PaymentServiceSelectionReqType *req) {
     if (!buf || !req) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -480,7 +576,7 @@ int jpv2g_cbv2g_encode_payment_service_selection_res(const uint8_t session_id[is
                                                        size_t out_len,
                                                        size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -496,7 +592,7 @@ int jpv2g_cbv2g_encode_payment_service_selection_res(const uint8_t session_id[is
 
 int jpv2g_cbv2g_decode_payment_service_selection_res(const uint8_t *buf, size_t len, struct iso2_PaymentServiceSelectionResType *res) {
     if (!buf || !res) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -520,7 +616,7 @@ int jpv2g_cbv2g_encode_charge_parameter_discovery_req(const uint8_t session_id[i
                                                         size_t out_len,
                                                         size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -542,7 +638,7 @@ int jpv2g_cbv2g_encode_charge_parameter_discovery_req(const uint8_t session_id[i
 
 int jpv2g_cbv2g_decode_charge_parameter_discovery_req(const uint8_t *buf, size_t len, struct iso2_ChargeParameterDiscoveryReqType *req) {
     if (!buf || !req) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -559,7 +655,7 @@ int jpv2g_cbv2g_encode_charge_parameter_discovery_res(const uint8_t session_id[i
                                                         size_t out_len,
                                                         size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -602,7 +698,7 @@ int jpv2g_cbv2g_encode_charge_parameter_discovery_res_payload(
     size_t out_len,
     size_t *written) {
     if (!out || !payload) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -618,7 +714,7 @@ int jpv2g_cbv2g_encode_charge_parameter_discovery_res_payload(
 
 int jpv2g_cbv2g_decode_charge_parameter_discovery_res(const uint8_t *buf, size_t len, struct iso2_ChargeParameterDiscoveryResType *res) {
     if (!buf || !res) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -634,7 +730,7 @@ int jpv2g_cbv2g_encode_cable_check_req(const uint8_t session_id[iso2_sessionIDTy
                                          size_t out_len,
                                          size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -654,7 +750,7 @@ int jpv2g_cbv2g_encode_cable_check_req(const uint8_t session_id[iso2_sessionIDTy
 
 int jpv2g_cbv2g_decode_cable_check_req(const uint8_t *buf, size_t len, struct iso2_CableCheckReqType *req) {
     if (!buf || !req) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -672,7 +768,7 @@ int jpv2g_cbv2g_encode_cable_check_res(const uint8_t session_id[iso2_sessionIDTy
                                          size_t out_len,
                                          size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -695,7 +791,7 @@ int jpv2g_cbv2g_encode_cable_check_res(const uint8_t session_id[iso2_sessionIDTy
 
 int jpv2g_cbv2g_decode_cable_check_res(const uint8_t *buf, size_t len, struct iso2_CableCheckResType *res) {
     if (!buf || !res) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -711,7 +807,7 @@ int jpv2g_cbv2g_encode_service_detail_req(const uint8_t session_id[iso2_sessionI
                                             size_t out_len,
                                             size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -728,7 +824,7 @@ int jpv2g_cbv2g_encode_service_detail_req(const uint8_t session_id[iso2_sessionI
 
 int jpv2g_cbv2g_decode_service_detail_req(const uint8_t *buf, size_t len, struct iso2_ServiceDetailReqType *req) {
     if (!buf || !req) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -746,7 +842,7 @@ int jpv2g_cbv2g_encode_service_detail_res(const uint8_t session_id[iso2_sessionI
                                             size_t out_len,
                                             size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -767,7 +863,7 @@ int jpv2g_cbv2g_encode_service_detail_res(const uint8_t session_id[iso2_sessionI
 
 int jpv2g_cbv2g_decode_service_detail_res(const uint8_t *buf, size_t len, struct iso2_ServiceDetailResType *res) {
     if (!buf || !res) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -784,7 +880,7 @@ int jpv2g_cbv2g_encode_payment_details_req(const uint8_t session_id[iso2_session
                                              size_t out_len,
                                              size_t *written) {
     if (!out || !emaid) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -809,7 +905,7 @@ int jpv2g_cbv2g_encode_payment_details_req(const uint8_t session_id[iso2_session
 
 int jpv2g_cbv2g_decode_payment_details_req(const uint8_t *buf, size_t len, struct iso2_PaymentDetailsReqType *req) {
     if (!buf || !req) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -828,7 +924,7 @@ int jpv2g_cbv2g_encode_payment_details_res(const uint8_t session_id[iso2_session
                                              size_t out_len,
                                              size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -863,7 +959,7 @@ int jpv2g_cbv2g_encode_payment_details_res(const uint8_t session_id[iso2_session
 
 int jpv2g_cbv2g_decode_payment_details_res(const uint8_t *buf, size_t len, struct iso2_PaymentDetailsResType *res) {
     if (!buf || !res) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -880,7 +976,7 @@ int jpv2g_cbv2g_encode_authorization_req(const uint8_t session_id[iso2_sessionID
                                            size_t out_len,
                                            size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -906,7 +1002,7 @@ int jpv2g_cbv2g_encode_authorization_req(const uint8_t session_id[iso2_sessionID
 
 int jpv2g_cbv2g_decode_authorization_req(const uint8_t *buf, size_t len, struct iso2_AuthorizationReqType *req) {
     if (!buf || !req) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -923,7 +1019,7 @@ int jpv2g_cbv2g_encode_authorization_res(const uint8_t session_id[iso2_sessionID
                                            size_t out_len,
                                            size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -941,7 +1037,7 @@ int jpv2g_cbv2g_encode_authorization_res(const uint8_t session_id[iso2_sessionID
 
 int jpv2g_cbv2g_decode_authorization_res(const uint8_t *buf, size_t len, struct iso2_AuthorizationResType *res) {
     if (!buf || !res) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -959,7 +1055,7 @@ int jpv2g_cbv2g_encode_power_delivery_req(const uint8_t session_id[iso2_sessionI
                                             size_t out_len,
                                             size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -980,7 +1076,7 @@ int jpv2g_cbv2g_encode_power_delivery_req(const uint8_t session_id[iso2_sessionI
 
 int jpv2g_cbv2g_decode_power_delivery_req(const uint8_t *buf, size_t len, struct iso2_PowerDeliveryReqType *req) {
     if (!buf || !req) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -997,7 +1093,7 @@ int jpv2g_cbv2g_encode_power_delivery_res(const uint8_t session_id[iso2_sessionI
                                             size_t out_len,
                                             size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -1006,8 +1102,22 @@ int jpv2g_cbv2g_encode_power_delivery_res(const uint8_t session_id[iso2_sessionI
     if (payload) {
         doc->V2G_Message.Body.PowerDeliveryRes = *payload;
     } else {
-        set_default_ac_status(&doc->V2G_Message.Body.PowerDeliveryRes.AC_EVSEStatus);
-        doc->V2G_Message.Body.PowerDeliveryRes.AC_EVSEStatus_isUsed = 1;
+        // DC charging fix (2026-06-23 drift audit §3.1): this is a DC-only
+        // charger, so the default PowerDeliveryRes must carry DC_EVSEStatus
+        // (which contains EVSEIsolationStatus=Valid), NOT AC_EVSEStatus. The
+        // pre-fix default emitted AC status, so isolation-validating EVCCs
+        // (Hyundai/Kia/BYD/GAC/MG and strict ISO 15118-2 stacks) never saw the
+        // isolation field at PowerDelivery and could abort. Mirror the DIN
+        // encoder (set_din_default_dc_evse_status) and the ISO2 CableCheck/
+        // PreCharge/CurrentDemand defaults. The decoder (secc.c) already expects
+        // DC_EVSEStatus here.
+        set_default_dc_evse_status(&doc->V2G_Message.Body.PowerDeliveryRes.DC_EVSEStatus);
+        doc->V2G_Message.Body.PowerDeliveryRes.DC_EVSEStatus_isUsed = 1;
+        doc->V2G_Message.Body.PowerDeliveryRes.AC_EVSEStatus_isUsed = 0;
+        // init_iso2_PowerDeliveryResType() already zeroes this, but set it
+        // explicitly to mirror the DIN encoder and stay robust if the choice of
+        // the three optional status fields (AC / DC / EVSEStatus) ever changes.
+        doc->V2G_Message.Body.PowerDeliveryRes.EVSEStatus_isUsed = 0;
     }
     doc->V2G_Message.Body.PowerDeliveryRes.ResponseCode = code;
 
@@ -1020,7 +1130,7 @@ int jpv2g_cbv2g_encode_power_delivery_res(const uint8_t session_id[iso2_sessionI
 
 int jpv2g_cbv2g_decode_power_delivery_res(const uint8_t *buf, size_t len, struct iso2_PowerDeliveryResType *res) {
     if (!buf || !res) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -1035,7 +1145,7 @@ int jpv2g_cbv2g_encode_charging_status_req(const uint8_t session_id[iso2_session
                                              size_t out_len,
                                              size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -1050,7 +1160,7 @@ int jpv2g_cbv2g_encode_charging_status_req(const uint8_t session_id[iso2_session
 
 int jpv2g_cbv2g_decode_charging_status_req(const uint8_t *buf, size_t len, struct iso2_ChargingStatusReqType *req) {
     if (!buf || !req) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -1069,7 +1179,7 @@ int jpv2g_cbv2g_encode_charging_status_res(const uint8_t session_id[iso2_session
                                              size_t out_len,
                                              size_t *written) {
     if (!out || !evse_id) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -1097,7 +1207,7 @@ int jpv2g_cbv2g_encode_charging_status_res(const uint8_t session_id[iso2_session
 
 int jpv2g_cbv2g_decode_charging_status_res(const uint8_t *buf, size_t len, struct iso2_ChargingStatusResType *res) {
     if (!buf || !res) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -1113,7 +1223,7 @@ int jpv2g_cbv2g_encode_current_demand_req(const uint8_t session_id[iso2_sessionI
                                             size_t out_len,
                                             size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -1137,7 +1247,7 @@ int jpv2g_cbv2g_encode_current_demand_req(const uint8_t session_id[iso2_sessionI
 
 int jpv2g_cbv2g_decode_current_demand_req(const uint8_t *buf, size_t len, struct iso2_CurrentDemandReqType *req) {
     if (!buf || !req) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -1154,7 +1264,7 @@ int jpv2g_cbv2g_encode_current_demand_res(const uint8_t session_id[iso2_sessionI
                                             size_t out_len,
                                             size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -1189,7 +1299,7 @@ int jpv2g_cbv2g_encode_current_demand_res(const uint8_t session_id[iso2_sessionI
 
 int jpv2g_cbv2g_decode_current_demand_res(const uint8_t *buf, size_t len, struct iso2_CurrentDemandResType *res) {
     if (!buf || !res) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -1207,7 +1317,7 @@ int jpv2g_cbv2g_encode_metering_receipt_req(const uint8_t session_id[iso2_sessio
                                               size_t out_len,
                                               size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -1241,7 +1351,7 @@ int jpv2g_cbv2g_encode_metering_receipt_req(const uint8_t session_id[iso2_sessio
 
 int jpv2g_cbv2g_decode_metering_receipt_req(const uint8_t *buf, size_t len, struct iso2_MeteringReceiptReqType *req) {
     if (!buf || !req) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -1258,7 +1368,7 @@ int jpv2g_cbv2g_encode_metering_receipt_res(const uint8_t session_id[iso2_sessio
                                               size_t out_len,
                                               size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -1267,8 +1377,16 @@ int jpv2g_cbv2g_encode_metering_receipt_res(const uint8_t session_id[iso2_sessio
     if (payload) {
         doc->V2G_Message.Body.MeteringReceiptRes = *payload;
     } else {
-        set_default_ac_status(&doc->V2G_Message.Body.MeteringReceiptRes.AC_EVSEStatus);
-        doc->V2G_Message.Body.MeteringReceiptRes.AC_EVSEStatus_isUsed = 1;
+        // DC charger: MeteringReceiptRes must carry DC_EVSEStatus, not
+        // AC_EVSEStatus. The pre-fix default emitted AC_EVSEStatus_isUsed=1,
+        // which is wrong for a DC station and inconsistent with the
+        // PowerDeliveryRes/CurrentDemandRes fix (which already select DC). The
+        // three status fields (AC/DC/EVSEStatus) are mutually exclusive options
+        // in MeteringReceiptRes; mirror PowerDeliveryRes exactly.
+        set_default_dc_evse_status(&doc->V2G_Message.Body.MeteringReceiptRes.DC_EVSEStatus);
+        doc->V2G_Message.Body.MeteringReceiptRes.DC_EVSEStatus_isUsed = 1;
+        doc->V2G_Message.Body.MeteringReceiptRes.AC_EVSEStatus_isUsed = 0;
+        doc->V2G_Message.Body.MeteringReceiptRes.EVSEStatus_isUsed = 0;
     }
     doc->V2G_Message.Body.MeteringReceiptRes.ResponseCode = code;
 
@@ -1281,7 +1399,7 @@ int jpv2g_cbv2g_encode_metering_receipt_res(const uint8_t session_id[iso2_sessio
 
 int jpv2g_cbv2g_decode_metering_receipt_res(const uint8_t *buf, size_t len, struct iso2_MeteringReceiptResType *res) {
     if (!buf || !res) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -1297,7 +1415,7 @@ int jpv2g_cbv2g_encode_session_stop_req(const uint8_t session_id[iso2_sessionIDT
                                           size_t out_len,
                                           size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -1314,7 +1432,7 @@ int jpv2g_cbv2g_encode_session_stop_req(const uint8_t session_id[iso2_sessionIDT
 
 int jpv2g_cbv2g_decode_session_stop_req(const uint8_t *buf, size_t len, struct iso2_SessionStopReqType *req) {
     if (!buf || !req) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -1330,7 +1448,7 @@ int jpv2g_cbv2g_encode_session_stop_res(const uint8_t session_id[iso2_sessionIDT
                                           size_t out_len,
                                           size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -1347,7 +1465,7 @@ int jpv2g_cbv2g_encode_session_stop_res(const uint8_t session_id[iso2_sessionIDT
 
 int jpv2g_cbv2g_decode_session_stop_res(const uint8_t *buf, size_t len, struct iso2_SessionStopResType *res) {
     if (!buf || !res) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -1363,7 +1481,7 @@ int jpv2g_cbv2g_encode_pre_charge_req(const uint8_t session_id[iso2_sessionIDTyp
                                         size_t out_len,
                                         size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -1386,7 +1504,7 @@ int jpv2g_cbv2g_encode_pre_charge_req(const uint8_t session_id[iso2_sessionIDTyp
 
 int jpv2g_cbv2g_decode_pre_charge_req(const uint8_t *buf, size_t len, struct iso2_PreChargeReqType *req) {
     if (!buf || !req) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -1403,7 +1521,7 @@ int jpv2g_cbv2g_encode_pre_charge_res(const uint8_t session_id[iso2_sessionIDTyp
                                         size_t out_len,
                                         size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -1426,7 +1544,7 @@ int jpv2g_cbv2g_encode_pre_charge_res(const uint8_t session_id[iso2_sessionIDTyp
 
 int jpv2g_cbv2g_decode_pre_charge_res(const uint8_t *buf, size_t len, struct iso2_PreChargeResType *res) {
     if (!buf || !res) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -1442,7 +1560,7 @@ int jpv2g_cbv2g_encode_welding_detection_req(const uint8_t session_id[iso2_sessi
                                                size_t out_len,
                                                size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -1463,7 +1581,7 @@ int jpv2g_cbv2g_encode_welding_detection_req(const uint8_t session_id[iso2_sessi
 
 int jpv2g_cbv2g_decode_welding_detection_req(const uint8_t *buf, size_t len, struct iso2_WeldingDetectionReqType *req) {
     if (!buf || !req) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -1480,7 +1598,7 @@ int jpv2g_cbv2g_encode_welding_detection_res(const uint8_t session_id[iso2_sessi
                                                size_t out_len,
                                                size_t *written) {
     if (!out) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -1503,7 +1621,7 @@ int jpv2g_cbv2g_encode_welding_detection_res(const uint8_t session_id[iso2_sessi
 
 int jpv2g_cbv2g_decode_welding_detection_res(const uint8_t *buf, size_t len, struct iso2_WeldingDetectionResType *res) {
     if (!buf || !res) return -EINVAL;
-    struct iso2_exiDocument *doc = &g_iso_doc_psram;
+    struct iso2_exiDocument *doc = iso_doc();
     init_iso2_exiDocument(doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)buf, len, 0, NULL);
@@ -1523,7 +1641,7 @@ int jpv2g_cbv2g_encode_din_session_setup_res(const uint8_t session_id[din_sessio
                                                size_t *written) {
     if (!session_id || !evse_id || !out) return -EINVAL;
     if (evse_id_len == 0 || evse_id_len > din_evseIDType_BYTES_SIZE) return -EINVAL;
-    struct din_exiDocument *doc = &g_din_doc_psram;
+    struct din_exiDocument *doc = din_doc();
     init_din_exiDocument(doc);
     set_din_header_session(&doc->V2G_Message.Header, session_id);
     init_din_BodyType(&doc->V2G_Message.Body);
@@ -1556,7 +1674,7 @@ int jpv2g_cbv2g_encode_din_service_discovery_res(const uint8_t session_id[din_se
                                                    size_t out_len,
                                                    size_t *written) {
     if (!session_id || !out) return -EINVAL;
-    struct din_exiDocument *doc = &g_din_doc_psram;
+    struct din_exiDocument *doc = din_doc();
     init_din_exiDocument(doc);
     set_din_header_session(&doc->V2G_Message.Header, session_id);
     init_din_BodyType(&doc->V2G_Message.Body);
@@ -1578,13 +1696,42 @@ int jpv2g_cbv2g_encode_din_service_discovery_res(const uint8_t session_id[din_se
     return 0;
 }
 
+/* VEH-3 (2026-07): DIN 70121 ServiceDetailRes. The DIN schema defines the
+ * message (single EVCharging service, optional ServiceParameterList) even
+ * though our charge service exposes no configurable parameters — so we answer
+ * OK, echo the requested ServiceID, and omit the parameter list. This exists so
+ * secc.c can stop returning -ENOTSUP for a DIN ServiceDetailReq (which tore
+ * down the TCP stream mid-handshake for EVs / test tools that probe it). */
+int jpv2g_cbv2g_encode_din_service_detail_res(const uint8_t session_id[din_sessionIDType_BYTES_SIZE],
+                                                din_responseCodeType code,
+                                                uint16_t service_id,
+                                                uint8_t *out,
+                                                size_t out_len,
+                                                size_t *written) {
+    if (!session_id || !out) return -EINVAL;
+    struct din_exiDocument *doc = din_doc();
+    init_din_exiDocument(doc);
+    set_din_header_session(&doc->V2G_Message.Header, session_id);
+    init_din_BodyType(&doc->V2G_Message.Body);
+    doc->V2G_Message.Body.ServiceDetailRes_isUsed = 1;
+    init_din_ServiceDetailResType(&doc->V2G_Message.Body.ServiceDetailRes);
+    doc->V2G_Message.Body.ServiceDetailRes.ResponseCode = code;
+    doc->V2G_Message.Body.ServiceDetailRes.ServiceID = service_id;
+    doc->V2G_Message.Body.ServiceDetailRes.ServiceParameterList_isUsed = 0;
+    exi_bitstream_t stream;
+    exi_bitstream_init(&stream, out, out_len, 0, NULL);
+    if (encode_din_exiDocument(&stream, doc) != 0) return -EIO;
+    if (written) *written = exi_bitstream_get_length(&stream);
+    return 0;
+}
+
 int jpv2g_cbv2g_encode_din_service_payment_selection_res(const uint8_t session_id[din_sessionIDType_BYTES_SIZE],
                                                            din_responseCodeType code,
                                                            uint8_t *out,
                                                            size_t out_len,
                                                            size_t *written) {
     if (!session_id || !out) return -EINVAL;
-    struct din_exiDocument *doc = &g_din_doc_psram;
+    struct din_exiDocument *doc = din_doc();
     init_din_exiDocument(doc);
     set_din_header_session(&doc->V2G_Message.Header, session_id);
     init_din_BodyType(&doc->V2G_Message.Body);
@@ -1606,7 +1753,7 @@ int jpv2g_cbv2g_encode_din_payment_details_res(const uint8_t session_id[din_sess
                                                  size_t out_len,
                                                  size_t *written) {
     if (!session_id || !out) return -EINVAL;
-    struct din_exiDocument *doc = &g_din_doc_psram;
+    struct din_exiDocument *doc = din_doc();
     init_din_exiDocument(doc);
     set_din_header_session(&doc->V2G_Message.Header, session_id);
     init_din_BodyType(&doc->V2G_Message.Body);
@@ -1636,7 +1783,7 @@ int jpv2g_cbv2g_encode_din_contract_authentication_res(const uint8_t session_id[
                                                          size_t out_len,
                                                          size_t *written) {
     if (!session_id || !out) return -EINVAL;
-    struct din_exiDocument *doc = &g_din_doc_psram;
+    struct din_exiDocument *doc = din_doc();
     init_din_exiDocument(doc);
     set_din_header_session(&doc->V2G_Message.Header, session_id);
     init_din_BodyType(&doc->V2G_Message.Body);
@@ -1653,24 +1800,33 @@ int jpv2g_cbv2g_encode_din_contract_authentication_res(const uint8_t session_id[
 
 int jpv2g_cbv2g_encode_din_charge_parameter_discovery_res(const uint8_t session_id[din_sessionIDType_BYTES_SIZE],
                                                             din_responseCodeType code,
+                                                            din_EVSEProcessingType processing,
                                                             const struct din_DC_EVSEChargeParameterType *dc_params,
                                                             uint8_t *out,
                                                             size_t out_len,
                                                             size_t *written) {
     if (!session_id || !out) return -EINVAL;
-    struct din_exiDocument *doc = &g_din_doc_psram;
+    struct din_exiDocument *doc = din_doc();
     init_din_exiDocument(doc);
     set_din_header_session(&doc->V2G_Message.Header, session_id);
     init_din_BodyType(&doc->V2G_Message.Body);
     doc->V2G_Message.Body.ChargeParameterDiscoveryRes_isUsed = 1;
     init_din_ChargeParameterDiscoveryResType(&doc->V2G_Message.Body.ChargeParameterDiscoveryRes);
     doc->V2G_Message.Body.ChargeParameterDiscoveryRes.ResponseCode = code;
-    doc->V2G_Message.Body.ChargeParameterDiscoveryRes.EVSEProcessing = din_EVSEProcessingType_Finished;
+    doc->V2G_Message.Body.ChargeParameterDiscoveryRes.EVSEProcessing = processing;
     doc->V2G_Message.Body.ChargeParameterDiscoveryRes.DC_EVSEChargeParameter_isUsed = 1;
     if (dc_params) {
         doc->V2G_Message.Body.ChargeParameterDiscoveryRes.DC_EVSEChargeParameter = *dc_params;
     } else {
         set_din_default_dc_charge_params(&doc->V2G_Message.Body.ChargeParameterDiscoveryRes.DC_EVSEChargeParameter);
+    }
+    // The DIN-required SAScheduleList is MANDATORY when EVSEProcessing=Finished
+    // (omitted pre-fix -> DIN EVs PeerReset and never charge). While Ongoing
+    // (controller limits not yet live) the EV is told to re-poll, and the
+    // schedule MUST be omitted -- emitting Finished + a schedule + zero limits is
+    // exactly the #2 idiom bug. Pair this with EVSE_NotReady in the DC params.
+    if (processing == din_EVSEProcessingType_Finished) {
+        set_default_din_sa_schedule(&doc->V2G_Message.Body.ChargeParameterDiscoveryRes);
     }
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, out, out_len, 0, NULL);
@@ -1686,7 +1842,7 @@ int jpv2g_cbv2g_encode_din_power_delivery_res(const uint8_t session_id[din_sessi
                                                 size_t out_len,
                                                 size_t *written) {
     if (!session_id || !out) return -EINVAL;
-    struct din_exiDocument *doc = &g_din_doc_psram;
+    struct din_exiDocument *doc = din_doc();
     init_din_exiDocument(doc);
     set_din_header_session(&doc->V2G_Message.Header, session_id);
     init_din_BodyType(&doc->V2G_Message.Body);
@@ -1715,7 +1871,7 @@ int jpv2g_cbv2g_encode_din_current_demand_res(const uint8_t session_id[din_sessi
                                                 size_t out_len,
                                                 size_t *written) {
     if (!session_id || !out) return -EINVAL;
-    struct din_exiDocument *doc = &g_din_doc_psram;
+    struct din_exiDocument *doc = din_doc();
     init_din_exiDocument(doc);
     set_din_header_session(&doc->V2G_Message.Header, session_id);
     init_din_BodyType(&doc->V2G_Message.Body);
@@ -1749,7 +1905,7 @@ int jpv2g_cbv2g_encode_din_metering_receipt_res(const uint8_t session_id[din_ses
                                                   size_t out_len,
                                                   size_t *written) {
     if (!session_id || !out) return -EINVAL;
-    struct din_exiDocument *doc = &g_din_doc_psram;
+    struct din_exiDocument *doc = din_doc();
     init_din_exiDocument(doc);
     set_din_header_session(&doc->V2G_Message.Header, session_id);
     init_din_BodyType(&doc->V2G_Message.Body);
@@ -1774,7 +1930,7 @@ int jpv2g_cbv2g_encode_din_session_stop_res(const uint8_t session_id[din_session
                                               size_t out_len,
                                               size_t *written) {
     if (!session_id || !out) return -EINVAL;
-    struct din_exiDocument *doc = &g_din_doc_psram;
+    struct din_exiDocument *doc = din_doc();
     init_din_exiDocument(doc);
     set_din_header_session(&doc->V2G_Message.Header, session_id);
     init_din_BodyType(&doc->V2G_Message.Body);
@@ -1795,7 +1951,7 @@ int jpv2g_cbv2g_encode_din_welding_detection_res(const uint8_t session_id[din_se
                                                    size_t out_len,
                                                    size_t *written) {
     if (!session_id || !out) return -EINVAL;
-    struct din_exiDocument *doc = &g_din_doc_psram;
+    struct din_exiDocument *doc = din_doc();
     init_din_exiDocument(doc);
     set_din_header_session(&doc->V2G_Message.Header, session_id);
     init_din_BodyType(&doc->V2G_Message.Body);
@@ -1822,7 +1978,7 @@ int jpv2g_cbv2g_encode_din_pre_charge_res(const uint8_t session_id[din_sessionID
                                             size_t out_len,
                                             size_t *written) {
     if (!session_id || !out) return -EINVAL;
-    struct din_exiDocument *doc = &g_din_doc_psram;
+    struct din_exiDocument *doc = din_doc();
     init_din_exiDocument(doc);
     set_din_header_session(&doc->V2G_Message.Header, session_id);
     init_din_BodyType(&doc->V2G_Message.Body);
@@ -1850,7 +2006,7 @@ int jpv2g_cbv2g_encode_din_cable_check_res(const uint8_t session_id[din_sessionI
                                              size_t out_len,
                                              size_t *written) {
     if (!session_id || !out) return -EINVAL;
-    struct din_exiDocument *doc = &g_din_doc_psram;
+    struct din_exiDocument *doc = din_doc();
     init_din_exiDocument(doc);
     set_din_header_session(&doc->V2G_Message.Header, session_id);
     init_din_BodyType(&doc->V2G_Message.Body);

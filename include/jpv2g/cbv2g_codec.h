@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -15,6 +16,17 @@
 #include "cbv2g/app_handshake/appHand_Datatypes.h"
 #include "cbv2g/din/din_msgDefDatatypes.h"
 #include "cbv2g/iso_2/iso2_msgDefDatatypes.h"
+
+// Pre-allocate the (large) ISO-15118 / DIN / app message documents from PSRAM at
+// boot, off the HLC timing path. OPTIONAL — the codec also allocates them lazily
+// on first use — but calling this in setup keeps the allocation out of the live
+// V2G handshake. Idempotent.
+void jpv2g_cbv2g_codec_init(void);
+
+// True once all three large EXI documents (app / ISO-2 / DIN) are allocated.
+// Lets the HLC bring-up gate on the codec being ready instead of risking a
+// NULL deref on the first V2G message if an allocation ever failed.
+bool jpv2g_cbv2g_codec_ready(void);
 
 int jpv2g_cbv2g_encode_sapp_req(const char *ns,
                                   uint32_t ver_major,
@@ -279,6 +291,12 @@ int jpv2g_cbv2g_encode_din_service_discovery_res(const uint8_t session_id[din_se
                                                    uint8_t *out,
                                                    size_t out_len,
                                                    size_t *written);
+int jpv2g_cbv2g_encode_din_service_detail_res(const uint8_t session_id[din_sessionIDType_BYTES_SIZE],
+                                                din_responseCodeType code,
+                                                uint16_t service_id,
+                                                uint8_t *out,
+                                                size_t out_len,
+                                                size_t *written);
 int jpv2g_cbv2g_encode_din_service_payment_selection_res(const uint8_t session_id[din_sessionIDType_BYTES_SIZE],
                                                            din_responseCodeType code,
                                                            uint8_t *out,
@@ -299,6 +317,7 @@ int jpv2g_cbv2g_encode_din_contract_authentication_res(const uint8_t session_id[
                                                          size_t *written);
 int jpv2g_cbv2g_encode_din_charge_parameter_discovery_res(const uint8_t session_id[din_sessionIDType_BYTES_SIZE],
                                                             din_responseCodeType code,
+                                                            din_EVSEProcessingType processing,
                                                             const struct din_DC_EVSEChargeParameterType *dc_params,
                                                             uint8_t *out,
                                                             size_t out_len,

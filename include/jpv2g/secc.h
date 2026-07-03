@@ -85,6 +85,15 @@ typedef struct {
     jpv2g_backend_t backend;
     jpv2g_evse_controller_t evse_ctl;
     uint8_t session_id[8];
+    /* Pause/resume memory (ISO 15118-2 SessionStop ChargingSession=Pause).
+     * last_session_id: SID retained from the most recent Pause (all-zero =
+     * none); last_session_end_ms: jpv2g_now_monotonic_ms() stamp of that pause.
+     * A SessionSetupReq presenting this SID inside the resume window is answered
+     * OK_OldSessionJoined; any other non-zero SID now gets a fresh SECC SID +
+     * OK_NewSessionEstablished (see secc_resolve_session). Zero-initialised by
+     * the jpv2g_secc_init() memset. */
+    uint8_t last_session_id[8];
+    int64_t last_session_end_ms;
     int64_t meter_Wh;
     char meter_id[16];
     /* Callbacks to build responses based on decoded requests. */
@@ -97,6 +106,14 @@ int jpv2g_secc_start_udp(jpv2g_secc_t *secc);
 int jpv2g_secc_start_tcp(jpv2g_secc_t *secc);
 int jpv2g_secc_start_tls(jpv2g_secc_t *secc);
 void jpv2g_secc_stop(jpv2g_secc_t *secc);
+
+/* Retire the LIVE session id without granting resume rights. Call on every
+ * client-connection teardown (TCP drop / idle timeout / codec error / local
+ * stop): the default handler only clears session_id on an orderly
+ * SessionStopRes, so an unclean drop would otherwise leave the dead SID
+ * joinable by the next connection. Preserves the SessionStop(Pause) memory in
+ * last_session_id / last_session_end_ms. */
+void jpv2g_secc_retire_session(jpv2g_secc_t *secc);
 
 /* Handle a single TCP client connection (plaintext). */
 int jpv2g_secc_handle_client(jpv2g_secc_t *secc, int client_fd, int timeout_ms);

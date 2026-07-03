@@ -73,3 +73,60 @@ static inline int jpv2g_socket_close(int fd) {
     return close(fd);
 #endif
 }
+
+// Half-close to wake a blocking recv() on `fd` from another task WITHOUT
+// releasing the fd number. Lets a second task signal "stop" to a worker blocked
+// in recv() while keeping that worker the sole owner of the eventual close() —
+// avoiding a double-close / fd-reuse race (PLC crash audit B3, 2026-06-24).
+static inline int jpv2g_socket_shutdown(int fd) {
+#if defined(lwip_shutdown)
+    return lwip_shutdown(fd, SHUT_RDWR);
+#else
+    return shutdown(fd, SHUT_RDWR);
+#endif
+}
+
+// EVX-1 (2026-07-03; matches EVerest EvseV2G 2025.12.0 "Wait for peer FIN before
+// closing TCP socket"): graceful, BOUNDED half-close for an orderly session end.
+// A bare close() on a socket that still has unread RX data makes lwIP emit a RST
+// instead of a FIN, which can discard the final Res the SECC just queued (e.g.
+// SessionStopRes / the Pause ACK) before the EV has read it. So: send our FIN
+// (SHUT_WR), then drain RX until the peer FINs (recv==0) / errors / the linger
+// budget elapses, then close. The per-recv SO_RCVTIMEO (200 ms) times the drain
+// and a hard iteration cap bounds total wall time to ~linger_ms so the HLC worker
+// never wedges on a chatty or half-dead peer.
+static inline int jpv2g_socket_graceful_close(int fd, int linger_ms) {
+    if (fd < 0) return -1;
+#if defined(lwip_shutdown)
+    (void)lwip_shutdown(fd, SHUT_WR);
+#else
+    (void)shutdown(fd, SHUT_WR);
+#endif
+    if (linger_ms > 0) {
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 200 * 1000;  // 200 ms per draining recv()
+#if defined(lwip_setsockopt)
+        (void)lwip_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#else
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+        char sink[64];
+        int iters = linger_ms / 200;
+        if (iters < 1) iters = 1;
+        if (iters > 10) iters = 10;  // hard cap: <= ~2 s total
+        for (int i = 0; i < iters; ++i) {
+#if defined(lwip_recv)
+            int n = lwip_recv(fd, sink, sizeof(sink), 0);
+#else
+            int n = (int)recv(fd, sink, sizeof(sink), 0);
+#endif
+            if (n <= 0) break;  // peer FIN (0), or error/timeout (<0)
+        }
+    }
+#if defined(lwip_close)
+    return lwip_close(fd);
+#else
+    return close(fd);
+#endif
+}

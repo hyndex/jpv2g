@@ -108,7 +108,20 @@ static jpv2g_protocol_t detect_protocol_from_app(const struct appHand_supportedA
         size_t ns_len = ap->ProtocolNamespace.charactersLen;
         uint8_t prio = ap->Priority;
         if (prio > best_prio) continue;
-        if (ns_contains(ns, ns_len, "iso:15118:2") || ns_contains(ns, ns_len, "iso:15118-2")) {
+        // V2G-HS-1 (2026-07-03 audit): only select ISO 15118-2 for a namespace
+        // that carries the "2013" schema marker — that is the exact grammar the
+        // vendored cbv2g iso2 codec can decode/encode. The old substring test on
+        // "iso:15118:2" alone also matched the legacy 2010 namespace
+        // ("urn:iso:15118:2:2010:MsgDef"); selecting it made every following
+        // message fail decode against the 2013 grammar and tore down the TCP
+        // stream mid-handshake. Requiring "2013" keeps us liberal about exact
+        // formatting (urn/colon/hyphen variants still match) while never
+        // committing to a variant we cannot actually speak — an EV that offers
+        // only 2010 correctly falls through to DIN (or Failed_NoNegotiation)
+        // instead of a dead ISO2 session.
+        const bool is_iso2_family =
+            ns_contains(ns, ns_len, "iso:15118:2") || ns_contains(ns, ns_len, "iso:15118-2");
+        if (is_iso2_family && ns_contains(ns, ns_len, "2013")) {
             if (prio < best_prio || best == JPV2G_PROTOCOL_UNKNOWN || best == JPV2G_PROTOCOL_DIN70121) {
                 best = JPV2G_PROTOCOL_ISO15118_2;
                 best_prio = prio;
@@ -808,6 +821,24 @@ static bool secc_has_active_session(const jpv2g_secc_t *secc) {
     return !secc_sid_all_zero(secc->session_id, sizeof(secc->session_id));
 }
 
+/* SessionStop(Pause) resume window. ISO 15118-2 leaves the pause retention time
+ * to the SECC; 60 minutes matches common EVSE practice and covers the "EV pauses
+ * for battery conditioning / resumes later" case while still ageing out SIDs
+ * from vehicles that left the bay. */
+#define SECC_PAUSE_RESUME_WINDOW_MS (60 * 60 * 1000)
+
+/* True iff `sid` matches the SID retained from the most recent
+ * SessionStop(ChargingSession=Pause) and that pause is still inside the resume
+ * window. This is the ONLY path allowed to answer OK_OldSessionJoined: a SID we
+ * never paused (or one past the window) must get a fresh session instead. */
+static bool secc_paused_session_resumable(const jpv2g_secc_t *secc, const uint8_t *sid) {
+    if (!secc || !sid) return false;
+    if (secc_sid_all_zero(secc->last_session_id, sizeof(secc->last_session_id))) return false;
+    if (memcmp(secc->last_session_id, sid, sizeof(secc->last_session_id)) != 0) return false;
+    const int64_t age_ms = jpv2g_now_monotonic_ms() - secc->last_session_end_ms;
+    return age_ms >= 0 && age_ms <= (int64_t)SECC_PAUSE_RESUME_WINDOW_MS;
+}
+
 static const uint8_t *secc_resolve_session(jpv2g_secc_t *secc,
                                            jpv2g_message_type_t type,
                                            const struct iso2_MessageHeaderType *iso_hdr,
@@ -831,9 +862,22 @@ static const uint8_t *secc_resolve_session(jpv2g_secc_t *secc,
     }
 
     if (type == JPV2G_SESSION_SETUP_REQ) {
-        if (incoming_has_sid && !incoming_sid_zero) {
+        /* VEH-2 (2026-07): ISO 15118-2 / DIN 70121 only permit
+         * OK_OldSessionJoined when the EV presents the SID of a session the
+         * SECC itself paused (SessionStop ChargingSession=Pause) and that pause
+         * is still inside the resume window. The old code echoed ANY non-zero
+         * incoming SID back as "joined", which (a) let a stale SID from a
+         * previous unclean drop resurrect a dead session, and (b) confused EVs
+         * that send a random SID on a fresh plug expecting a NEW session. Now
+         * we grant resume only for a genuine paused SID; every other case gets
+         * a freshly generated SECC SID and OK_NewSessionEstablished. */
+        if (incoming_has_sid && !incoming_sid_zero &&
+            secc_paused_session_resumable(secc, incoming_sid)) {
             memcpy(secc->session_id, incoming_sid, sizeof(secc->session_id));
             if (old_session_joined) *old_session_joined = true;
+            /* Consume the pause memory: a resume may only be honoured once. */
+            memset(secc->last_session_id, 0, sizeof(secc->last_session_id));
+            secc->last_session_end_ms = 0;
         } else {
             jpv2g_generate_session_id(NULL, secc->session_id);
         }
@@ -1139,8 +1183,33 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
                                                                written);
         }
         case JPV2G_SERVICE_DETAIL_REQ: {
-            if (req->protocol == JPV2G_PROTOCOL_DIN70121) return -ENOTSUP;
-            return jpv2g_cbv2g_encode_service_detail_res(sid, iso2_responseCodeType_OK, 1, NULL, out, out_len, written);
+            /* VEH-3 (2026-07): a non-zero handler rc tears down the whole TCP
+             * stream (handle_stream exits on handler_rc != 0), so ServiceDetail
+             * must ALWAYS answer with a well-formed Res. The DIN 70121 schema
+             * DOES define ServiceDetailReq/Res (single EVCharging service, no
+             * parameter sets) and some EVs / test tools probe it; the old
+             * -ENOTSUP read as "EVSE died" to the vehicle mid-handshake. Both
+             * protocols now echo the REQUESTED ServiceID (the ISO2 path
+             * previously hardcoded 1, mismatching any EV that asked about a
+             * different id) with OK and no parameter list — never punish a
+             * quirky EV for asking. */
+            uint16_t requested_service_id = 1;
+            if (req->protocol == JPV2G_PROTOCOL_DIN70121) {
+                if (req->body) {
+                    const struct din_ServiceDetailReqType *rq =
+                        (const struct din_ServiceDetailReqType *)req->body;
+                    requested_service_id = rq->ServiceID;
+                }
+                return jpv2g_cbv2g_encode_din_service_detail_res(
+                    sid, din_responseCodeType_OK, requested_service_id, out, out_len, written);
+            }
+            if (req->body) {
+                const struct iso2_ServiceDetailReqType *rq =
+                    (const struct iso2_ServiceDetailReqType *)req->body;
+                requested_service_id = rq->ServiceID;
+            }
+            return jpv2g_cbv2g_encode_service_detail_res(
+                sid, iso2_responseCodeType_OK, requested_service_id, NULL, out, out_len, written);
         }
         case JPV2G_PAYMENT_SERVICE_SELECTION_REQ: {
             if (req->protocol == JPV2G_PROTOCOL_DIN70121) {
@@ -1178,7 +1247,8 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
         }
         case JPV2G_CHARGE_PARAMETER_DISCOVERY_REQ: {
             if (req->protocol == JPV2G_PROTOCOL_DIN70121) {
-                return jpv2g_cbv2g_encode_din_charge_parameter_discovery_res(sid, din_responseCodeType_OK, NULL, out, out_len, written);
+                return jpv2g_cbv2g_encode_din_charge_parameter_discovery_res(
+                    sid, din_responseCodeType_OK, din_EVSEProcessingType_Finished, NULL, out, out_len, written);
             }
             iso2_EnergyTransferModeType requested_etm = secc_select_iso_etm(secc);
             if (req->body) {
@@ -1302,11 +1372,13 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
                 init_din_MeteringReceiptResType(&res);
                 return jpv2g_cbv2g_encode_din_metering_receipt_res(sid, din_responseCodeType_OK, &res, out, out_len, written);
             }
-            struct iso2_MeteringReceiptResType res;
-            init_iso2_MeteringReceiptResType(&res);
-            res.ResponseCode = iso2_responseCodeType_OK;
-            res.AC_EVSEStatus_isUsed = 0;
-            return jpv2g_cbv2g_encode_metering_receipt_res(sid, iso2_responseCodeType_OK, &res, out, out_len, written);
+            // DC charger: pass NULL so the encoder applies its DC_EVSEStatus
+            // default. A local all-zero-isUsed struct would emit NO status field
+            // (the encoder copies the payload verbatim, defeating the default).
+            // Dormant under EIM-only DC (ReceiptRequired is never set =1), but
+            // kept consistent with PowerDeliveryRes/CurrentDemandRes for when PnC
+            // / ReceiptRequired is enabled.
+            return jpv2g_cbv2g_encode_metering_receipt_res(sid, iso2_responseCodeType_OK, NULL, out, out_len, written);
         }
         case JPV2G_WELDING_DETECTION_REQ: {
             if (req->protocol == JPV2G_PROTOCOL_DIN70121) {
@@ -1316,10 +1388,29 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
         }
         case JPV2G_SESSION_STOP_REQ: {
             int rc = 0;
+            /* VEH-2 (2026-07): ISO 15118-2 lets the EV request a PAUSE (as
+             * opposed to a terminate) via SessionStopReq.ChargingSession =
+             * Pause. When it does, remember the live SID + a monotonic
+             * timestamp so a follow-up SessionSetupReq presenting the same SID
+             * inside SECC_PAUSE_RESUME_WINDOW_MS can be answered
+             * OK_OldSessionJoined (secc_paused_session_resumable). A terminate
+             * (or DIN, which has no pause concept) leaves the pause memory
+             * clear. Either way the LIVE session_id is retired so the current
+             * TCP stream can't keep transacting under a closed session. */
+            bool ev_paused = false;
+            if (req->protocol != JPV2G_PROTOCOL_DIN70121 && req->body) {
+                const struct iso2_SessionStopReqType *rq =
+                    (const struct iso2_SessionStopReqType *)req->body;
+                ev_paused = (rq->ChargingSession == iso2_chargingSessionType_Pause);
+            }
             if (req->protocol == JPV2G_PROTOCOL_DIN70121) {
                 rc = jpv2g_cbv2g_encode_din_session_stop_res(sid, din_responseCodeType_OK, out, out_len, written);
             } else {
                 rc = jpv2g_cbv2g_encode_session_stop_res(sid, iso2_responseCodeType_OK, out, out_len, written);
+            }
+            if (ev_paused && !secc_sid_all_zero(secc->session_id, sizeof(secc->session_id))) {
+                memcpy(secc->last_session_id, secc->session_id, sizeof(secc->last_session_id));
+                secc->last_session_end_ms = jpv2g_now_monotonic_ms();
             }
             memset(secc->session_id, 0, sizeof(secc->session_id));
             return rc;
@@ -1429,6 +1520,17 @@ void jpv2g_secc_stop(jpv2g_secc_t *secc) {
     jpv2g_udp_server_stop(&secc->udp);
     jpv2g_tcp_server_stop(&secc->tcp);
     jpv2g_tcp_server_stop(&secc->tls);
+}
+
+void jpv2g_secc_retire_session(jpv2g_secc_t *secc) {
+    if (!secc) return;
+    /* Retire the LIVE session only. The default JPV2G_SESSION_STOP_REQ handler
+     * clears session_id on an orderly SessionStopRes, but an unclean drop (TCP
+     * reset / idle timeout / codec error) never reaches it — leaving the dead
+     * SID joinable. Callers on every connection teardown zero it here.
+     * last_session_id / last_session_end_ms (the SessionStop-Pause resume
+     * memory) are deliberately preserved so a genuine pause can still resume. */
+    memset(secc->session_id, 0, sizeof(secc->session_id));
 }
 
 /* Per-call observation state for handle_stream. Lives on the caller's
