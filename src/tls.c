@@ -193,7 +193,11 @@ ssize_t jpv2g_tls_send(jpv2g_tls_socket_t *sock, const uint8_t *buf, size_t len)
         rc = mbedtls_ssl_write(sock->ssl, buf, len);
     } while (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE);
     if (rc < 0) return rc;
-    return 0;
+    /* mbedtls_ssl_write follows send(2): success is the number of plaintext
+     * bytes consumed and may be shorter than len.  Returning zero here made
+     * every successful TLS write look like a short/failed send to both EVCC
+     * and SECC callers. */
+    return (ssize_t)rc;
 }
 
 ssize_t jpv2g_tls_recv(jpv2g_tls_socket_t *sock, uint8_t *buf, size_t len, int timeout_ms) {

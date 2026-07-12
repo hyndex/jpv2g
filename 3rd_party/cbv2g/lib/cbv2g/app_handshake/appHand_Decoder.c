@@ -295,7 +295,7 @@ static int decode_appHand_AppProtocolType(exi_bitstream_t* stream, struct appHan
 
 // Element: definition=complex; name={urn:iso:15118:2:2010:AppProtocol}supportedAppProtocolReq; type=AnonymousType; base type=; content type=ELEMENT-ONLY;
 //          abstract=False; final=False;
-// Particle: AppProtocol, AppProtocolType (1, 5) (original max 20);
+// Particle: AppProtocol, AppProtocolType (1, 20);
 static int decode_appHand_supportedAppProtocolReq(exi_bitstream_t* stream, struct appHand_supportedAppProtocolReq* supportedAppProtocolReq) {
     int grammar_id = 7;
     int done = 0;
@@ -318,13 +318,13 @@ static int decode_appHand_supportedAppProtocolReq(exi_bitstream_t* stream, struc
                 case 0:
                     // Event: START (AppProtocol, AppProtocolType (AppProtocolType)); next=8
                     // decode: element array
-                    if (supportedAppProtocolReq->AppProtocol.arrayLen < appHand_AppProtocolType_5_ARRAY_SIZE)
+                    if (supportedAppProtocolReq->AppProtocol.arrayLen < appHand_AppProtocolType_20_ARRAY_SIZE)
                     {
                         error = decode_appHand_AppProtocolType(stream, &supportedAppProtocolReq->AppProtocol.array[supportedAppProtocolReq->AppProtocol.arrayLen++]);
                     }
                     else
                     {
-                        // static array not large enough, only appHand_AppProtocolType_5_ARRAY_SIZE elements
+                        // static array not large enough, only appHand_AppProtocolType_20_ARRAY_SIZE elements
                         error = EXI_ERROR__ARRAY_OUT_OF_BOUNDS;
                     }
                     grammar_id = 8;
@@ -345,17 +345,17 @@ static int decode_appHand_supportedAppProtocolReq(exi_bitstream_t* stream, struc
                 case 0:
                     // Event: LOOP (AppProtocol, AppProtocolType (AppProtocolType)); next=8
                     // decode: element array
-                    if (supportedAppProtocolReq->AppProtocol.arrayLen < appHand_AppProtocolType_5_ARRAY_SIZE)
+                    if (supportedAppProtocolReq->AppProtocol.arrayLen < appHand_AppProtocolType_20_ARRAY_SIZE)
                     {
                         error = decode_appHand_AppProtocolType(stream, &supportedAppProtocolReq->AppProtocol.array[supportedAppProtocolReq->AppProtocol.arrayLen++]);
                     }
                     else
                     {
-                        // static array not large enough, only appHand_AppProtocolType_5_ARRAY_SIZE elements
+                        // static array not large enough, only appHand_AppProtocolType_20_ARRAY_SIZE elements
                         error = EXI_ERROR__ARRAY_OUT_OF_BOUNDS;
                     }
                     // LOOP breakout code for schema given maximum, regardless of ARRAY_SIZE definition
-                    if (supportedAppProtocolReq->AppProtocol.arrayLen < 20)
+                    if (supportedAppProtocolReq->AppProtocol.arrayLen < appHand_AppProtocolType_20_ARRAY_SIZE)
                     {
                         grammar_id = 8;
                     }
@@ -596,5 +596,4 @@ int decode_appHand_exiDocument(exi_bitstream_t* stream, struct appHand_exiDocume
 
     return error;
 }
-
 

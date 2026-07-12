@@ -33,7 +33,12 @@ extern "C" {
 
 
 #define appHand_ProtocolNamespace_CHARACTER_SIZE (100)
-#define appHand_AppProtocolType_5_ARRAY_SIZE (5)
+/* ISO 15118-2 permits up to 20 AppProtocol offers.  The generated model used
+ * to retain only five entries, so a conforming EV that advertised a sixth
+ * protocol failed EXI decoding before the SECC could answer negotiation. */
+#define appHand_AppProtocolType_20_ARRAY_SIZE (20)
+/* Source-compatibility alias for users of the original generated symbol. */
+#define appHand_AppProtocolType_5_ARRAY_SIZE appHand_AppProtocolType_20_ARRAY_SIZE
 
 
 // enum for function numbers
@@ -72,11 +77,11 @@ struct appHand_AppProtocolType {
 
 // Element: definition=complex; name={urn:iso:15118:2:2010:AppProtocol}supportedAppProtocolReq; type=AnonymousType; base type=; content type=ELEMENT-ONLY;
 //          abstract=False; final=False;
-// Particle: AppProtocol, AppProtocolType (1, 5) (original max 20);
+// Particle: AppProtocol, AppProtocolType (1, 20);
 struct appHand_supportedAppProtocolReq {
     // AppProtocol, AppProtocolType
     struct {
-        struct appHand_AppProtocolType array[appHand_AppProtocolType_5_ARRAY_SIZE];
+        struct appHand_AppProtocolType array[appHand_AppProtocolType_20_ARRAY_SIZE];
         uint16_t arrayLen;
     } AppProtocol;
 };
@@ -117,4 +122,3 @@ void init_appHand_AppProtocolType(struct appHand_AppProtocolType* AppProtocolTyp
 #endif
 
 #endif /* APP_HANDSHAKE_DATATYPES_H */
-

@@ -29,7 +29,7 @@ time compatibility helper, tests/docs/examples).
 
 ## State Handling
 
-State logic is identical to the original source:
+The generic linked-list state-machine API remains available for compatibility:
 
 - `jpv2g_sm_handle()` validates expected message type and dispatches current state handler.
 - EVCC sequence builder (`jpv2g_evcc_build_sequence`) produces:
@@ -41,6 +41,13 @@ State logic is identical to the original source:
 - Final state behavior:
   - EVCC remains on final state and permits repeated handling.
   - SECC remains on final state once reached.
+
+The production SECC stream additionally uses `jpv2g_secc_sequence_t`. Unlike
+the legacy linear example, this validator represents optional service/payment
+messages and repeatable Authorization, CableCheck, PreCharge, CurrentDemand,
+MeteringReceipt, and WeldingDetection exchanges. It rejects out-of-order
+requests, protocol switching, and post-SessionSetup requests with a missing or
+foreign SessionID before invoking application handlers.
 
 ## MCU Portability Hooks
 
@@ -62,8 +69,10 @@ These hooks avoid direct dependency on Linux-only timing behavior in EVCC/SECC/T
 
 ### Networking
 
-- Linux networking support was removed.
-- Socket transport is lwIP-only and intended for microcontroller targets.
+- ESP32 production builds use lwIP.
+- Host CMake builds use the native POSIX socket API through the same
+  `platform_compat.h` boundary, which keeps full transport and stream behavior
+  testable on Linux and macOS.
 
 ## Build and Test (Host)
 

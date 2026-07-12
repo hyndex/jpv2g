@@ -80,7 +80,9 @@ Microcontroller Notes
 - For ESP-IDF/Arduino, ``jpv2g_random_bytes`` uses ``esp_fill_random`` when available.
 - You can override RNG with ``jpv2g_set_random_provider`` for hardware TRNG integration.
 - ``time_compat`` provides MCU-safe monotonic time and sleep helpers used by EVCC/SECC/TLS paths.
-- Socket transport is lwIP-only.
+- Production ESP32 socket transport uses lwIP. Native POSIX sockets are also
+  supported so the complete library and stream-level tests build on Linux and
+  macOS rather than compiling only a reduced protocol subset.
 
 Developer Documentation
 -----------------------

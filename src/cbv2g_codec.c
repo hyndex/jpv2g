@@ -27,7 +27,8 @@
 #endif
 
 // The ISO-15118 / DIN / app message documents are large (iso2 ~24 KB, din ~11 KB,
-// app ~0.6 KB). They were declared EXT_RAM_ATTR to live in PSRAM, but the
+// app ~2.4 KB with the schema-permitted 20 protocol offers). They were declared
+// EXT_RAM_ATTR to live in PSRAM, but the
 // precompiled Arduino SDK does not enable BSS-in-PSRAM
 // (CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is off), so EXT_RAM_ATTR silently
 // fell back to internal .dram0.bss — pinning ~35 KB of scarce internal SRAM. We
@@ -153,8 +154,13 @@ int jpv2g_cbv2g_encode_sapp_res(uint8_t schema_id,
     doc->supportedAppProtocolRes_isUsed = 1;
     init_appHand_supportedAppProtocolRes(&doc->supportedAppProtocolRes);
     doc->supportedAppProtocolRes.ResponseCode = code;
-    doc->supportedAppProtocolRes.SchemaID = schema_id;
-    doc->supportedAppProtocolRes.SchemaID_isUsed = 1;
+    /* SchemaID is optional in the XSD and must identify a selected offer.  A
+     * Failed_NoNegotiation response selected nothing, so strict EVCCs expect
+     * the field to be absent rather than an arbitrary schema identifier. */
+    if (code != appHand_responseCodeType_Failed_NoNegotiation) {
+        doc->supportedAppProtocolRes.SchemaID = schema_id;
+        doc->supportedAppProtocolRes.SchemaID_isUsed = 1;
+    }
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, out, out_len, 0, NULL);
     if (encode_appHand_exiDocument(&stream, doc) != 0) return -EIO;
@@ -1822,9 +1828,11 @@ int jpv2g_cbv2g_encode_din_charge_parameter_discovery_res(const uint8_t session_
     }
     // The DIN-required SAScheduleList is MANDATORY when EVSEProcessing=Finished
     // (omitted pre-fix -> DIN EVs PeerReset and never charge). While Ongoing
-    // (controller limits not yet live) the EV is told to re-poll, and the
-    // schedule MUST be omitted -- emitting Finished + a schedule + zero limits is
-    // exactly the #2 idiom bug. Pair this with EVSE_NotReady in the DC params.
+    // (controller limits not yet live) the EV is told to re-poll and the
+    // concrete SAScheduleList is omitted. The generated DIN grammar represents
+    // that branch with the empty abstract SASchedules element. Emitting Finished
+    // with a concrete schedule plus zero limits is exactly the #2 idiom bug;
+    // pair Ongoing with EVSE_NotReady in the DC params.
     if (processing == din_EVSEProcessingType_Finished) {
         set_default_din_sa_schedule(&doc->V2G_Message.Body.ChargeParameterDiscoveryRes);
     }

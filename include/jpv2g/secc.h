@@ -51,6 +51,8 @@ typedef enum {
     JPV2G_HLC_DROP_HANDLER_ERROR = 8,         /* downstream response handler returned non-zero */
     JPV2G_HLC_DROP_LOCAL_STOP = 9,            /* local code closed the socket */
     JPV2G_HLC_DROP_INVALID_ARG = 10,          /* misuse of the API */
+    JPV2G_HLC_DROP_SEQUENCE_ERROR = 11,        /* decoded request is invalid in the current protocol phase */
+    JPV2G_HLC_DROP_UNKNOWN_SESSION = 12,       /* missing, stale, or mismatched V2G SessionID */
 } jpv2g_hlc_drop_reason_t;
 
 /* Map a rc returned from jpv2g_secc_handle_client_detect() (or the
@@ -63,6 +65,8 @@ typedef enum {
  *   rc == -ECONNRESET     -> PEER_RESET
  *   rc == -EIO            -> TCP_SEND_FAIL
  *   rc == -EBADMSG/-E2BIG -> CODEC_ERROR
+ *   rc == -EPROTO         -> SEQUENCE_ERROR
+ *   rc == -EACCES         -> UNKNOWN_SESSION
  *   rc == -EINVAL         -> INVALID_ARG
  *   anything else negative-> TCP_RECV_FAIL (catch-all socket-level error)
  *
@@ -153,3 +157,11 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
                                 uint8_t *out,
                                 size_t out_len,
                                 size_t *written);
+
+/* Validate the V2G message-header SessionID before invoking a request handler.
+ * SupportedAppProtocol has no V2G header, while SessionSetup may carry either
+ * an empty/new-session SID or an eight-byte resume candidate. Every later
+ * request must present the currently active eight-byte SID. */
+int jpv2g_secc_validate_request_session(const jpv2g_secc_t *secc,
+                                        jpv2g_message_type_t type,
+                                        const jpv2g_secc_request_t *req);

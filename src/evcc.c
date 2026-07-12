@@ -47,6 +47,35 @@ static int evcc_recv_bytes(jpv2g_evcc_t *evcc, uint8_t *buf, size_t len, int tim
     return 0;
 }
 
+/* Write the complete V2GTP frame. send()/mbedtls_ssl_write() are allowed to
+ * consume only a prefix; dropping that tail corrupts the next peer decode. */
+static int evcc_send_bytes(jpv2g_evcc_t *evcc,
+                           const uint8_t *buf,
+                           size_t len,
+                           int timeout_ms) {
+    if (!evcc || (!buf && len != 0)) return -EINVAL;
+    size_t off = 0;
+    const int64_t deadline = timeout_ms > 0 ? jpv2g_now_monotonic_ms() + timeout_ms : 0;
+    while (off < len) {
+        if (timeout_ms > 0 && jpv2g_now_monotonic_ms() >= deadline) return -ETIMEDOUT;
+        const ssize_t sent = evcc->tls_enabled
+                                 ? jpv2g_tls_send(&evcc->tls, buf + off, len - off)
+                                 : jpv2g_tcp_send(evcc->tcp.fd, buf + off, len - off);
+        if (sent == 0) return -EPIPE;
+        if (sent < 0) {
+            if (sent == -EINTR) continue;
+            if (sent == -EAGAIN || sent == -EWOULDBLOCK) {
+                jpv2g_sleep_ms(1);
+                continue;
+            }
+            return (int)sent;
+        }
+        if ((size_t)sent > len - off) return -EIO;
+        off += (size_t)sent;
+    }
+    return 0;
+}
+
 int jpv2g_evcc_init(jpv2g_evcc_t *evcc, const jpv2g_evcc_config_t *cfg, jpv2g_codec_ctx *codec) {
     if (!evcc || !cfg || !codec) return -EINVAL;
     memset(evcc, 0, sizeof(*evcc));
@@ -124,15 +153,9 @@ int jpv2g_evcc_send_v2gtp(jpv2g_evcc_t *evcc, jpv2g_payload_type_t type, const u
         free(buf);
         return rc;
     }
-    ssize_t sent;
-    if (evcc->tls_enabled) {
-        sent = jpv2g_tls_send(&evcc->tls, buf, written);
-    } else {
-        sent = jpv2g_tcp_send(evcc->tcp.fd, buf, written);
-    }
+    rc = evcc_send_bytes(evcc, buf, written, JPV2G_TIMEOUT_COMM_SETUP);
     free(buf);
-    if (sent < 0 || (size_t)sent != written) return (int)sent;
-    return 0;
+    return rc;
 }
 
 int jpv2g_evcc_recv_v2gtp(jpv2g_evcc_t *evcc, uint8_t *buf, size_t buf_len, jpv2g_v2gtp_t *out, int timeout_ms) {

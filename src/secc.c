@@ -30,6 +30,7 @@
 #include "jpv2g/messages.h"
 #include "jpv2g/platform_compat.h"
 #include "jpv2g/session.h"
+#include "jpv2g/state_secc.h"
 #include "jpv2g/v2gtp.h"
 #include "jpv2g/log.h"
 #include "jpv2g/time_compat.h"
@@ -98,67 +99,82 @@ static bool ns_contains(const char *haystack, size_t hay_len, const char *needle
     return false;
 }
 
-static jpv2g_protocol_t detect_protocol_from_app(const struct appHand_supportedAppProtocolReq *app) {
-    if (!app) return JPV2G_PROTOCOL_UNKNOWN;
-    jpv2g_protocol_t best = JPV2G_PROTOCOL_UNKNOWN;
-    uint8_t best_prio = 0xFF;
-    for (uint16_t i = 0; i < app->AppProtocol.arrayLen; ++i) {
-        const struct appHand_AppProtocolType *ap = &app->AppProtocol.array[i];
-        const char *ns = (const char *)ap->ProtocolNamespace.characters;
-        size_t ns_len = ap->ProtocolNamespace.charactersLen;
-        uint8_t prio = ap->Priority;
-        if (prio > best_prio) continue;
-        // V2G-HS-1 (2026-07-03 audit): only select ISO 15118-2 for a namespace
-        // that carries the "2013" schema marker — that is the exact grammar the
-        // vendored cbv2g iso2 codec can decode/encode. The old substring test on
-        // "iso:15118:2" alone also matched the legacy 2010 namespace
-        // ("urn:iso:15118:2:2010:MsgDef"); selecting it made every following
-        // message fail decode against the 2013 grammar and tore down the TCP
-        // stream mid-handshake. Requiring "2013" keeps us liberal about exact
-        // formatting (urn/colon/hyphen variants still match) while never
-        // committing to a variant we cannot actually speak — an EV that offers
-        // only 2010 correctly falls through to DIN (or Failed_NoNegotiation)
-        // instead of a dead ISO2 session.
-        const bool is_iso2_family =
-            ns_contains(ns, ns_len, "iso:15118:2") || ns_contains(ns, ns_len, "iso:15118-2");
-        if (is_iso2_family && ns_contains(ns, ns_len, "2013")) {
-            if (prio < best_prio || best == JPV2G_PROTOCOL_UNKNOWN || best == JPV2G_PROTOCOL_DIN70121) {
-                best = JPV2G_PROTOCOL_ISO15118_2;
-                best_prio = prio;
-            }
-            continue;
-        }
-        if (ns_contains(ns, ns_len, "din:70121")) {
-            if (prio < best_prio || best == JPV2G_PROTOCOL_UNKNOWN) {
-                best = JPV2G_PROTOCOL_DIN70121;
-                best_prio = prio;
-            }
-        }
-    }
-    return best;
+static uint16_t app_protocol_offer_count(const struct appHand_supportedAppProtocolReq *app) {
+    if (!app) return 0;
+    return app->AppProtocol.arrayLen > appHand_AppProtocolType_20_ARRAY_SIZE
+               ? appHand_AppProtocolType_20_ARRAY_SIZE
+               : app->AppProtocol.arrayLen;
 }
 
-static uint8_t select_schema_for_protocol(const struct appHand_supportedAppProtocolReq *app,
-                                          jpv2g_protocol_t protocol) {
-    if (!app || app->AppProtocol.arrayLen == 0) return 1;
-    uint8_t best_schema = app->AppProtocol.array[0].SchemaID;
-    uint8_t best_prio = 0xFF;
-    for (uint16_t i = 0; i < app->AppProtocol.arrayLen; ++i) {
-        const struct appHand_AppProtocolType *ap = &app->AppProtocol.array[i];
-        const char *ns = (const char *)ap->ProtocolNamespace.characters;
-        size_t ns_len = ap->ProtocolNamespace.charactersLen;
-        bool ns_match = false;
-        if (protocol == JPV2G_PROTOCOL_ISO15118_2) {
-            ns_match = ns_contains(ns, ns_len, "iso:15118:2") || ns_contains(ns, ns_len, "iso:15118-2");
-        } else if (protocol == JPV2G_PROTOCOL_DIN70121) {
-            ns_match = ns_contains(ns, ns_len, "din:70121");
-        }
-        if (!ns_match) continue;
-        if (ap->Priority > best_prio) continue;
-        best_prio = ap->Priority;
-        best_schema = ap->SchemaID;
+/* The vendored ISO-2 grammar is the 2013 MsgDef. DIN retains its established
+ * namespace compatibility because all deployed DIN offers identify 70121 and
+ * the vendored DIN decoder is the only DIN grammar in this library. */
+static bool app_protocol_offer_matches(const struct appHand_AppProtocolType *ap,
+                                       jpv2g_protocol_t protocol) {
+    if (!ap) return false;
+    const char *ns = (const char *)ap->ProtocolNamespace.characters;
+    const size_t ns_len = ap->ProtocolNamespace.charactersLen;
+    if (protocol == JPV2G_PROTOCOL_ISO15118_2) {
+        const bool iso2_family =
+            ns_contains(ns, ns_len, "iso:15118:2") || ns_contains(ns, ns_len, "iso:15118-2");
+        return iso2_family && ns_contains(ns, ns_len, "2013");
     }
-    return best_schema;
+    if (protocol == JPV2G_PROTOCOL_DIN70121) {
+        return ns_contains(ns, ns_len, "din:70121");
+    }
+    return false;
+}
+
+enum {
+    SECC_SAPP_SUPPORTED_MAJOR = 2,
+    SECC_SAPP_SUPPORTED_MINOR = 0,
+};
+
+typedef struct {
+    jpv2g_protocol_t protocol;
+    const struct appHand_AppProtocolType *offer;
+    appHand_responseCodeType response_code;
+} secc_app_selection_t;
+
+static secc_app_selection_t select_app_protocol(const struct appHand_supportedAppProtocolReq *app) {
+    secc_app_selection_t selection = {
+        .protocol = JPV2G_PROTOCOL_UNKNOWN,
+        .offer = NULL,
+        .response_code = appHand_responseCodeType_Failed_NoNegotiation,
+    };
+    uint8_t best_priority = UINT8_MAX;
+    for (uint16_t i = 0; i < app_protocol_offer_count(app); ++i) {
+        const struct appHand_AppProtocolType *ap = &app->AppProtocol.array[i];
+        if (selection.offer && ap->Priority >= best_priority) continue;
+
+        jpv2g_protocol_t candidate = JPV2G_PROTOCOL_UNKNOWN;
+        if (app_protocol_offer_matches(ap, JPV2G_PROTOCOL_ISO15118_2)) {
+            candidate = JPV2G_PROTOCOL_ISO15118_2;
+        } else if (app_protocol_offer_matches(ap, JPV2G_PROTOCOL_DIN70121)) {
+            candidate = JPV2G_PROTOCOL_DIN70121;
+        }
+        if (candidate == JPV2G_PROTOCOL_UNKNOWN ||
+            ap->VersionNumberMajor != SECC_SAPP_SUPPORTED_MAJOR) {
+            continue;
+        }
+
+        /* V2G2-169/170: select the EVCC's highest-priority mutually supported
+         * protocol. A minor-version mismatch remains mutually supported when
+         * the major version matches, but the response must disclose the
+         * deviation. The first offer wins an invalid equal-priority tie. */
+        selection.protocol = candidate;
+        selection.offer = ap;
+        selection.response_code =
+            ap->VersionNumberMinor == SECC_SAPP_SUPPORTED_MINOR
+                ? appHand_responseCodeType_OK_SuccessfulNegotiation
+                : appHand_responseCodeType_OK_SuccessfulNegotiationWithMinorDeviation;
+        best_priority = ap->Priority;
+    }
+    return selection;
+}
+
+static jpv2g_protocol_t detect_protocol_from_app(const struct appHand_supportedAppProtocolReq *app) {
+    return select_app_protocol(app).protocol;
 }
 
 static const char *secc_msg_name(jpv2g_message_type_t type) {
@@ -184,9 +200,9 @@ static const char *secc_msg_name(jpv2g_message_type_t type) {
 
 static void secc_log_exi_hex(const char *tag, jpv2g_message_type_t type, const uint8_t *payload, size_t len) {
     if (!tag || !payload || len == 0) return;
-    const size_t max_dump = 96;
-    size_t dump_len = len > max_dump ? max_dump : len;
-    char hex[(max_dump * 2) + 1];
+    enum { SECC_LOG_MAX_DUMP = 96 };
+    size_t dump_len = len > SECC_LOG_MAX_DUMP ? SECC_LOG_MAX_DUMP : len;
+    char hex[(SECC_LOG_MAX_DUMP * 2) + 1];
     if (jpv2g_bytes_to_hex(payload, dump_len, hex, sizeof(hex)) != 0) return;
     JPV2G_INFO("%s %s exi_len=%u exi_hex=%s%s",
                tag,
@@ -434,6 +450,41 @@ static const char *secc_iso_charging_session_str(iso2_chargingSessionType s) {
     }
 }
 
+static int secc_accept_request_sequence(jpv2g_secc_sequence_t *sequence,
+                                        jpv2g_message_type_t mtype,
+                                        const jpv2g_secc_request_t *request) {
+    if (!sequence || !request) return -EINVAL;
+    if (mtype != JPV2G_POWER_DELIVERY_REQ) {
+        return jpv2g_secc_sequence_accept(sequence, request->protocol, mtype);
+    }
+    if (!request->body) return -EBADMSG;
+
+    if (request->protocol == JPV2G_PROTOCOL_DIN70121) {
+        const struct din_PowerDeliveryReqType *power_delivery =
+            (const struct din_PowerDeliveryReqType *)request->body;
+        return jpv2g_secc_sequence_accept_power_delivery(
+            sequence, request->protocol, power_delivery->ReadyToChargeState != 0);
+    }
+    if (request->protocol == JPV2G_PROTOCOL_ISO15118_2) {
+        const struct iso2_PowerDeliveryReqType *power_delivery =
+            (const struct iso2_PowerDeliveryReqType *)request->body;
+        switch (power_delivery->ChargeProgress) {
+            case iso2_chargeProgressType_Start:
+                return jpv2g_secc_sequence_accept_power_delivery(
+                    sequence, request->protocol, true);
+            case iso2_chargeProgressType_Stop:
+                return jpv2g_secc_sequence_accept_power_delivery(
+                    sequence, request->protocol, false);
+            case iso2_chargeProgressType_Renegotiate:
+                return jpv2g_secc_sequence_accept_renegotiation(
+                    sequence, request->protocol);
+            default:
+                return -EPROTO;
+        }
+    }
+    return -EPROTO;
+}
+
 static void secc_log_decoded_app(jpv2g_message_type_t mtype,
                                  const jpv2g_secc_request_t *req,
                                  const uint8_t *out_payload,
@@ -453,7 +504,7 @@ static void secc_log_decoded_app(jpv2g_message_type_t mtype,
     char offered[320];
     size_t off = 0;
     offered[0] = '\0';
-    for (uint16_t i = 0; i < app->AppProtocol.arrayLen; ++i) {
+    for (uint16_t i = 0; i < app_protocol_offer_count(app); ++i) {
         const struct appHand_AppProtocolType *ap = &app->AppProtocol.array[i];
         int w = snprintf(offered + off,
                          sizeof(offered) - off,
@@ -821,6 +872,39 @@ static bool secc_has_active_session(const jpv2g_secc_t *secc) {
     return !secc_sid_all_zero(secc->session_id, sizeof(secc->session_id));
 }
 
+int jpv2g_secc_validate_request_session(const jpv2g_secc_t *secc,
+                                        jpv2g_message_type_t type,
+                                        const jpv2g_secc_request_t *req) {
+    if (!secc || !req) return -EINVAL;
+    if (type == JPV2G_SUPP_APP_PROTOCOL_REQ) return 0;
+
+    const uint8_t *incoming_sid = NULL;
+    size_t incoming_len = 0;
+    if (req->protocol == JPV2G_PROTOCOL_ISO15118_2 && req->header) {
+        incoming_sid = req->header->SessionID.bytes;
+        incoming_len = req->header->SessionID.bytesLen;
+    } else if (req->protocol == JPV2G_PROTOCOL_DIN70121 && req->din_header) {
+        incoming_sid = req->din_header->SessionID.bytes;
+        incoming_len = req->din_header->SessionID.bytesLen;
+    } else {
+        return -EINVAL;
+    }
+
+    /* SessionSetup establishes or resumes the session. Both the omitted SID
+     * form and the fixed-width resume candidate are valid inputs; the default
+     * handler decides whether the candidate is actually resumable. */
+    if (type == JPV2G_SESSION_SETUP_REQ) {
+        return (incoming_len == 0 || incoming_len == sizeof(secc->session_id)) ? 0 : -EINVAL;
+    }
+
+    if (incoming_len != sizeof(secc->session_id) ||
+        !secc_has_active_session(secc) ||
+        memcmp(incoming_sid, secc->session_id, sizeof(secc->session_id)) != 0) {
+        return -EACCES;
+    }
+    return 0;
+}
+
 /* SessionStop(Pause) resume window. ISO 15118-2 leaves the pause retention time
  * to the SECC; 60 minutes matches common EVSE practice and covers the "EV pauses
  * for battery conditioning / resumes later" case while still ageing out SIDs
@@ -907,39 +991,103 @@ static void secc_fill_iso_meter_info(jpv2g_secc_t *secc, struct iso2_MeterInfoTy
     meter->MeterStatus_isUsed = 1;
 }
 
-static void secc_fill_din_meter_info(jpv2g_secc_t *secc, struct din_MeterInfoType *meter) {
-    if (!secc || !meter) return;
-    init_din_MeterInfoType(meter);
-    size_t len = strlen(secc->meter_id);
-    if (len >= din_MeterID_CHARACTER_SIZE) len = din_MeterID_CHARACTER_SIZE - 1;
-    memcpy(meter->MeterID.characters, secc->meter_id, len);
-    meter->MeterID.charactersLen = (uint16_t)len;
-    meter->MeterReading.Value = (int16_t)(secc->meter_Wh);
-    meter->MeterReading.Multiplier = 0;
-    meter->MeterReading.Unit = din_unitSymbolType_Wh;
-    meter->MeterReading_isUsed = 1;
-}
-
 static void secc_bump_meter(jpv2g_secc_t *secc, int64_t delta_Wh) {
     if (!secc) return;
     secc->meter_Wh += delta_Wh;
     if (secc->meter_Wh < 0) secc->meter_Wh = 0;
 }
 
+static bool secc_config_has_energy_mode(const jpv2g_secc_t *secc, const char *mode) {
+    if (!secc || !mode || !*mode) return false;
+    const char *cursor = secc->cfg.supported_energy_modes;
+    const size_t wanted_len = strlen(mode);
+    while (*cursor) {
+        while (*cursor == ',' || *cursor == ' ' || *cursor == '\t') ++cursor;
+        const char *end = cursor;
+        while (*end && *end != ',') ++end;
+        const char *trimmed_end = end;
+        while (trimmed_end > cursor &&
+               (trimmed_end[-1] == ' ' || trimmed_end[-1] == '\t')) {
+            --trimmed_end;
+        }
+        if ((size_t)(trimmed_end - cursor) == wanted_len &&
+            memcmp(cursor, mode, wanted_len) == 0) {
+            return true;
+        }
+        cursor = end;
+    }
+    return false;
+}
+
+static bool secc_config_has_any_dc_mode(const jpv2g_secc_t *secc) {
+    return secc_config_has_energy_mode(secc, "DC_core") ||
+           secc_config_has_energy_mode(secc, "DC_extended") ||
+           secc_config_has_energy_mode(secc, "DC_combo_core") ||
+           secc_config_has_energy_mode(secc, "DC_unique");
+}
+
+static bool secc_config_has_any_din_dc_mode(const jpv2g_secc_t *secc) {
+    return secc_config_has_energy_mode(secc, "DC_core") ||
+           secc_config_has_energy_mode(secc, "DC_extended");
+}
+
 static iso2_EnergyTransferModeType secc_select_iso_etm(const jpv2g_secc_t *secc) {
-    (void)secc;
-    return iso2_EnergyTransferModeType_DC_extended;
+    if (secc_config_has_energy_mode(secc, "DC_core")) {
+        return iso2_EnergyTransferModeType_DC_core;
+    }
+    if (secc_config_has_energy_mode(secc, "DC_extended")) {
+        return iso2_EnergyTransferModeType_DC_extended;
+    }
+    if (secc_config_has_energy_mode(secc, "DC_combo_core")) {
+        return iso2_EnergyTransferModeType_DC_combo_core;
+    }
+    return iso2_EnergyTransferModeType_DC_core;
 }
 
 static din_EVSESupportedEnergyTransferType secc_select_din_etm(const jpv2g_secc_t *secc) {
-    (void)secc;
+    /* DIN ServiceDiscovery permits one EnergyTransferType, and DIN charging
+     * profiles use DC_core (DC on Type-1/Type-2 core pins) or DC_extended (CCS
+     * extended DC pins).  The generated shared enum also contains DC_dual, but
+     * DIN 70121 does not permit that value.  This CCS DC stack therefore
+     * prefers the physically truthful DC_extended when the generic config lists
+     * both; a core-pin implementation can configure DC_core only. */
+    if (secc_config_has_energy_mode(secc, "DC_extended")) {
+        return din_EVSESupportedEnergyTransferType_DC_extended;
+    }
+    if (secc_config_has_energy_mode(secc, "DC_core")) {
+        return din_EVSESupportedEnergyTransferType_DC_core;
+    }
     return din_EVSESupportedEnergyTransferType_DC_extended;
 }
 
-static bool secc_iso_etm_supported(iso2_EnergyTransferModeType etm) {
-    return etm == iso2_EnergyTransferModeType_DC_core ||
-           etm == iso2_EnergyTransferModeType_DC_extended ||
-           etm == iso2_EnergyTransferModeType_DC_combo_core;
+static bool secc_iso_etm_supported(const jpv2g_secc_t *secc,
+                                   iso2_EnergyTransferModeType etm) {
+    switch (etm) {
+        case iso2_EnergyTransferModeType_DC_core:
+            return secc_config_has_energy_mode(secc, "DC_core") ||
+                   !secc_config_has_any_dc_mode(secc);
+        case iso2_EnergyTransferModeType_DC_extended:
+            return secc_config_has_energy_mode(secc, "DC_extended");
+        case iso2_EnergyTransferModeType_DC_combo_core:
+            return secc_config_has_energy_mode(secc, "DC_combo_core");
+        case iso2_EnergyTransferModeType_DC_unique:
+            return secc_config_has_energy_mode(secc, "DC_unique");
+        default:
+            return false;
+    }
+}
+
+static bool secc_din_etm_supported(const jpv2g_secc_t *secc,
+                                   din_EVRequestedEnergyTransferType etm) {
+    switch (etm) {
+        case din_EVRequestedEnergyTransferType_DC_core:
+            return secc_config_has_energy_mode(secc, "DC_core");
+        case din_EVRequestedEnergyTransferType_DC_extended:
+            return secc_config_has_energy_mode(secc, "DC_extended") ||
+                   !secc_config_has_any_din_dc_mode(secc);
+        default:
+            return false;
+    }
 }
 
 static int secc_encode_iso_service_discovery_res_multi(
@@ -1106,28 +1254,31 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
     switch (type) {
         case JPV2G_SUPP_APP_PROTOCOL_REQ: {
             const struct appHand_supportedAppProtocolReq *app = (const struct appHand_supportedAppProtocolReq *)req->body;
-            jpv2g_protocol_t det = detect_protocol_from_app(app);
-            uint8_t schema = select_schema_for_protocol(app, det);
+            const secc_app_selection_t selection = select_app_protocol(app);
+            const uint8_t schema = selection.offer ? selection.offer->SchemaID : 0;
             if (app) {
-                for (uint16_t i = 0; i < app->AppProtocol.arrayLen; ++i) {
+                for (uint16_t i = 0; i < app_protocol_offer_count(app); ++i) {
                     const struct appHand_AppProtocolType *ap = &app->AppProtocol.array[i];
                     char ns_buf[96];
                     size_t n = ap->ProtocolNamespace.charactersLen;
                     if (n >= sizeof(ns_buf)) n = sizeof(ns_buf) - 1;
                     memcpy(ns_buf, ap->ProtocolNamespace.characters, n);
                     ns_buf[n] = '\0';
-                    JPV2G_INFO("SAPP opt[%u] schema=%u prio=%u ns=%s",
+                    JPV2G_INFO("SAPP opt[%u] schema=%u prio=%u version=%lu.%lu ns=%s",
                                (unsigned)i,
                                (unsigned)ap->SchemaID,
                                (unsigned)ap->Priority,
+                               (unsigned long)ap->VersionNumberMajor,
+                               (unsigned long)ap->VersionNumberMinor,
                                ns_buf);
                 }
             }
-            JPV2G_INFO("SAPP selected proto=%d schema=%u", (int)det, (unsigned)schema);
-            appHand_responseCodeType code = det != JPV2G_PROTOCOL_UNKNOWN
-                                                ? appHand_responseCodeType_OK_SuccessfulNegotiation
-                                                : appHand_responseCodeType_Failed_NoNegotiation;
-            return jpv2g_cbv2g_encode_sapp_res(schema, code, out, out_len, written);
+            JPV2G_INFO("SAPP selected proto=%d schema=%u response=%d",
+                       (int)selection.protocol,
+                       (unsigned)schema,
+                       (int)selection.response_code);
+            return jpv2g_cbv2g_encode_sapp_res(
+                schema, selection.response_code, out, out_len, written);
         }
         case JPV2G_SESSION_SETUP_REQ: {
             if (req->protocol == JPV2G_PROTOCOL_DIN70121) {
@@ -1165,16 +1316,27 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
                                                                      written);
             }
             const iso2_paymentOptionType payments[1] = {iso2_paymentOptionType_ExternalPayment};
-            const iso2_EnergyTransferModeType etms[3] = {
-                iso2_EnergyTransferModeType_DC_core,
-                iso2_EnergyTransferModeType_DC_extended,
-                iso2_EnergyTransferModeType_DC_combo_core};
+            iso2_EnergyTransferModeType etms[4];
+            size_t etm_count = 0;
+            if (secc_config_has_energy_mode(secc, "DC_core")) {
+                etms[etm_count++] = iso2_EnergyTransferModeType_DC_core;
+            }
+            if (secc_config_has_energy_mode(secc, "DC_extended")) {
+                etms[etm_count++] = iso2_EnergyTransferModeType_DC_extended;
+            }
+            if (secc_config_has_energy_mode(secc, "DC_combo_core")) {
+                etms[etm_count++] = iso2_EnergyTransferModeType_DC_combo_core;
+            }
+            if (secc_config_has_energy_mode(secc, "DC_unique")) {
+                etms[etm_count++] = iso2_EnergyTransferModeType_DC_unique;
+            }
+            if (etm_count == 0) etms[etm_count++] = secc_select_iso_etm(secc);
             return secc_encode_iso_service_discovery_res_multi(sid,
                                                                iso2_responseCodeType_OK,
                                                                payments,
                                                                1,
                                                                etms,
-                                                               3,
+                                                               etm_count,
                                                                1,
                                                                "DCFC",
                                                                free_service,
@@ -1247,8 +1409,16 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
         }
         case JPV2G_CHARGE_PARAMETER_DISCOVERY_REQ: {
             if (req->protocol == JPV2G_PROTOCOL_DIN70121) {
+                din_responseCodeType code = din_responseCodeType_OK;
+                if (req->body) {
+                    const struct din_ChargeParameterDiscoveryReqType *cpd =
+                        (const struct din_ChargeParameterDiscoveryReqType *)req->body;
+                    if (!secc_din_etm_supported(secc, cpd->EVRequestedEnergyTransferType)) {
+                        code = din_responseCodeType_FAILED_WrongEnergyTransferType;
+                    }
+                }
                 return jpv2g_cbv2g_encode_din_charge_parameter_discovery_res(
-                    sid, din_responseCodeType_OK, din_EVSEProcessingType_Finished, NULL, out, out_len, written);
+                    sid, code, din_EVSEProcessingType_Finished, NULL, out, out_len, written);
             }
             iso2_EnergyTransferModeType requested_etm = secc_select_iso_etm(secc);
             if (req->body) {
@@ -1257,7 +1427,7 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
                 requested_etm = cpd->RequestedEnergyTransferMode;
             }
             iso2_responseCodeType code = iso2_responseCodeType_OK;
-            if (!secc_iso_etm_supported(requested_etm)) {
+            if (!secc_iso_etm_supported(secc, requested_etm)) {
                 code = iso2_responseCodeType_FAILED_WrongEnergyTransferMode;
             }
             return jpv2g_cbv2g_encode_charge_parameter_discovery_res(sid, code, requested_etm, out, out_len, written);
@@ -1469,6 +1639,32 @@ static int secc_recv_bytes(secc_recv_fn fn, void *ctx, uint8_t *buf, size_t len,
     return 0;
 }
 
+static int secc_send_bytes(secc_send_fn fn,
+                           void *ctx,
+                           const uint8_t *buf,
+                           size_t len,
+                           int timeout_ms) {
+    if (!fn || (!buf && len != 0)) return -EINVAL;
+    size_t off = 0;
+    const int64_t deadline = timeout_ms > 0 ? jpv2g_now_monotonic_ms() + timeout_ms : 0;
+    while (off < len) {
+        if (timeout_ms > 0 && jpv2g_now_monotonic_ms() >= deadline) return -ETIMEDOUT;
+        const ssize_t sent = fn(ctx, buf + off, len - off);
+        if (sent == 0) return -EPIPE;
+        if (sent < 0) {
+            if (sent == -EINTR) continue;
+            if (sent == -EAGAIN || sent == -EWOULDBLOCK) {
+                jpv2g_sleep_ms(1);
+                continue;
+            }
+            return (int)sent;
+        }
+        if ((size_t)sent > len - off) return -EIO;
+        off += (size_t)sent;
+    }
+    return 0;
+}
+
 static int secc_recv_v2gtp(secc_recv_fn fn, void *ctx, uint8_t *buf, size_t buf_len, jpv2g_v2gtp_t *out, int timeout_ms) {
     if (buf_len < JPV2G_V2GTP_HEADER_LEN) return -ENOSPC;
     int rc = secc_recv_bytes(fn, ctx, buf, JPV2G_V2GTP_HEADER_LEN, timeout_ms);
@@ -1573,6 +1769,8 @@ static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
     bool handled_any = false;
     bool saw_session_stop = false;
     jpv2g_message_type_t last_msg = JPV2G_UNKNOWN_MESSAGE;
+    jpv2g_secc_sequence_t sequence;
+    jpv2g_secc_sequence_init(&sequence);
     int stream_rc = 0;
     /* Helper: write observation state and break out of the loop with the
      * given rc. Saves us from having to touch every `return` to keep
@@ -1614,20 +1812,6 @@ static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
             req_ctx.protocol = protocol;
             req_ctx.body = &app_req;
             req_log_ctx = req_ctx;
-            const int64_t handler_started_ms = jpv2g_now_monotonic_ms();
-            if (secc->handle_request) {
-                handler_rc = secc->handle_request(mtype, &req_ctx, out_payload, sizeof(out_payload), &out_len, secc->user_ctx);
-            } else {
-                handler_rc = jpv2g_secc_default_handle(secc, mtype, &req_ctx, out_payload, sizeof(out_payload), &out_len);
-            }
-            if (secc_timing_log_enabled(mtype)) {
-                const int64_t handler_finished_ms = jpv2g_now_monotonic_ms();
-                JPV2G_WARN("TIMING %s handler_ms=%lld out_len=%u rc=%d",
-                           secc_msg_name(mtype),
-                           (long long)(handler_finished_ms - handler_started_ms),
-                           (unsigned)out_len,
-                           handler_rc);
-            }
             decoded_ok = true;
         }
 
@@ -1700,20 +1884,6 @@ static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
                     req_ctx.body = decoded;
                     req_log_ctx = req_ctx;
                     req_log_ctx.body = secc_copy_req_body_for_log(req_ctx.protocol, mtype, req_ctx.body, &req_log_copy);
-                    const int64_t handler_started_ms = jpv2g_now_monotonic_ms();
-                    if (secc->handle_request) {
-                        handler_rc = secc->handle_request(mtype, &req_ctx, out_payload, sizeof(out_payload), &out_len, secc->user_ctx);
-                    } else {
-                        handler_rc = jpv2g_secc_default_handle(secc, mtype, &req_ctx, out_payload, sizeof(out_payload), &out_len);
-                    }
-                    if (secc_timing_log_enabled(mtype)) {
-                        const int64_t handler_finished_ms = jpv2g_now_monotonic_ms();
-                        JPV2G_WARN("TIMING %s handler_ms=%lld out_len=%u rc=%d",
-                                   secc_msg_name(mtype),
-                                   (long long)(handler_finished_ms - handler_started_ms),
-                                   (unsigned)out_len,
-                                   handler_rc);
-                    }
                     decoded_ok = true;
                 }
             }
@@ -1788,20 +1958,6 @@ static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
                     req_ctx.body = decoded;
                     req_log_ctx = req_ctx;
                     req_log_ctx.body = secc_copy_req_body_for_log(req_ctx.protocol, mtype, req_ctx.body, &req_log_copy);
-                    const int64_t handler_started_ms = jpv2g_now_monotonic_ms();
-                    if (secc->handle_request) {
-                        handler_rc = secc->handle_request(mtype, &req_ctx, out_payload, sizeof(out_payload), &out_len, secc->user_ctx);
-                    } else {
-                        handler_rc = jpv2g_secc_default_handle(secc, mtype, &req_ctx, out_payload, sizeof(out_payload), &out_len);
-                    }
-                    if (secc_timing_log_enabled(mtype)) {
-                        const int64_t handler_finished_ms = jpv2g_now_monotonic_ms();
-                        JPV2G_WARN("TIMING %s handler_ms=%lld out_len=%u rc=%d",
-                                   secc_msg_name(mtype),
-                                   (long long)(handler_finished_ms - handler_started_ms),
-                                   (unsigned)out_len,
-                                   handler_rc);
-                    }
                     decoded_ok = true;
                 }
             }
@@ -1818,6 +1974,40 @@ static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
             JPV2G_WARN("Failed to decode EXI message (payload_len=%u)", (unsigned)msg.payload_length);
             SECC_STREAM_EXIT(-EBADMSG);
         }
+
+        rc = secc_accept_request_sequence(&sequence, mtype, &req_ctx);
+        if (rc != 0) {
+            JPV2G_WARN("Invalid request sequence: phase=%d type=%s protocol=%d",
+                       (int)sequence.phase,
+                       secc_msg_name(mtype),
+                       (int)req_ctx.protocol);
+            SECC_STREAM_EXIT(rc);
+        }
+        rc = jpv2g_secc_validate_request_session(secc, mtype, &req_ctx);
+        if (rc != 0) {
+            JPV2G_WARN("Invalid SessionID for %s protocol=%d rc=%d",
+                       secc_msg_name(mtype),
+                       (int)req_ctx.protocol,
+                       rc);
+            SECC_STREAM_EXIT(rc);
+        }
+
+        const int64_t handler_started_ms = jpv2g_now_monotonic_ms();
+        if (secc->handle_request) {
+            handler_rc = secc->handle_request(
+                mtype, &req_ctx, out_payload, sizeof(out_payload), &out_len, secc->user_ctx);
+        } else {
+            handler_rc = jpv2g_secc_default_handle(
+                secc, mtype, &req_ctx, out_payload, sizeof(out_payload), &out_len);
+        }
+        if (secc_timing_log_enabled(mtype)) {
+            const int64_t handler_finished_ms = jpv2g_now_monotonic_ms();
+            JPV2G_WARN("TIMING %s handler_ms=%lld out_len=%u rc=%d",
+                       secc_msg_name(mtype),
+                       (long long)(handler_finished_ms - handler_started_ms),
+                       (unsigned)out_len,
+                       handler_rc);
+        }
         JPV2G_INFO("RX %s (proto=%d)", secc_msg_name(mtype), (int)req_ctx.protocol);
         secc_log_exi_hex("RX", mtype, msg.payload, msg.payload_length);
         if (handler_rc != 0) {
@@ -1832,9 +2022,9 @@ static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
         rc = jpv2g_v2gtp_build(JPV2G_PAYLOAD_EXI, out_payload, out_len, out, sizeof(out), &total);
         if (rc != 0) SECC_STREAM_EXIT(rc);
         const int64_t send_started_ms = jpv2g_now_monotonic_ms();
-        ssize_t sent = send_fn(send_ctx, out, total);
+        rc = secc_send_bytes(send_fn, send_ctx, out, total, timeout_ms);
         const int64_t send_finished_ms = jpv2g_now_monotonic_ms();
-        if (sent < 0 || (size_t)sent != total) SECC_STREAM_EXIT(-EIO);
+        if (rc != 0) SECC_STREAM_EXIT(rc);
         if (mtype != JPV2G_UNKNOWN_MESSAGE) {
             last_msg = mtype;
             if (mtype == JPV2G_SESSION_STOP_REQ) {
@@ -1846,7 +2036,7 @@ static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
                        secc_msg_name(mtype),
                        (long long)(send_finished_ms - send_started_ms),
                        (unsigned)total,
-                       (long long)sent);
+                       (long long)total);
         }
         JPV2G_INFO("TX %s bytes=%u", secc_msg_name(mtype), (unsigned)total);
         handled_any = true;
@@ -1992,6 +2182,8 @@ const char *jpv2g_hlc_drop_reason_name(jpv2g_hlc_drop_reason_t reason) {
         case JPV2G_HLC_DROP_HANDLER_ERROR:        return "HandlerError";
         case JPV2G_HLC_DROP_LOCAL_STOP:           return "LocalStop";
         case JPV2G_HLC_DROP_INVALID_ARG:          return "InvalidArg";
+        case JPV2G_HLC_DROP_SEQUENCE_ERROR:       return "SequenceError";
+        case JPV2G_HLC_DROP_UNKNOWN_SESSION:      return "UnknownSession";
         case JPV2G_HLC_DROP_UNKNOWN:
         default:                                   return "Unknown";
     }
@@ -2024,6 +2216,15 @@ jpv2g_hlc_drop_reason_t jpv2g_secc_classify_disconnect(int rc,
          * that returns it is the v2gtp send path or out_len==0 fallthrough.
          * Both indicate an outbound failure, so report TCP send-fail. */
         return JPV2G_HLC_DROP_TCP_SEND_FAIL;
+    }
+    if (rc == -EPIPE) {
+        return JPV2G_HLC_DROP_TCP_SEND_FAIL;
+    }
+    if (rc == -EPROTO) {
+        return JPV2G_HLC_DROP_SEQUENCE_ERROR;
+    }
+    if (rc == -EACCES) {
+        return JPV2G_HLC_DROP_UNKNOWN_SESSION;
     }
     if (rc == -EINVAL) {
         return JPV2G_HLC_DROP_INVALID_ARG;

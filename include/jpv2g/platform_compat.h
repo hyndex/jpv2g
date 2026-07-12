@@ -10,7 +10,14 @@
 #include <stdio.h>
 #include <string.h>
 
-/* MCU-only stack: lwIP is required for socket networking. */
+/*
+ * Socket portability boundary.
+ *
+ * The production ESP32 build uses lwIP, while the library's CMake build and
+ * unit/integration tests run against the native POSIX socket API.  Keep the
+ * wrapper functions below identical for both environments so networking code
+ * does not need platform conditionals of its own.
+ */
 #if defined(__has_include) && __has_include(<lwip/sockets.h>)
 #include <lwip/sockets.h>
 #include <lwip/inet.h>
@@ -33,7 +40,17 @@
 #endif
 #define JPV2G_HAVE_LWIP 1
 #else
-#error "jpv2g is microcontroller-only and requires lwIP headers."
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <net/if.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <unistd.h>
+#define JPV2G_HAVE_POSIX_SOCKETS 1
+#define JPV2G_HAVE_IF_NAMETOINDEX 1
 #endif
 
 #ifndef JPV2G_HAVE_IF_NAMETOINDEX
@@ -46,6 +63,7 @@ static inline unsigned int jpv2g_if_nametoindex(const char *ifname) {
     if (!ifname || !ifname[0]) return 0;
     unsigned int idx = if_nametoindex(ifname);
     if (idx != 0) return idx;
+#if defined(JPV2G_HAVE_LWIP)
 #if defined(__has_include) && __has_include(<lwip/netif.h>)
     /* lwIP if_nametoindex can fail for app-added netifs on some ESP-IDF builds. */
     struct netif *n = netif_list;
@@ -61,6 +79,7 @@ static inline unsigned int jpv2g_if_nametoindex(const char *ifname) {
         }
         n = n->next;
     }
+#endif
 #endif
     return 0;
 }

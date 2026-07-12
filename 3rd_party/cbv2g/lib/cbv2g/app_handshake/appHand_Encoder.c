@@ -185,12 +185,20 @@ static int encode_appHand_AppProtocolType(exi_bitstream_t* stream, const struct 
 
 // Element: definition=complex; name={urn:iso:15118:2:2010:AppProtocol}supportedAppProtocolReq; type=AnonymousType; base type=; content type=ELEMENT-ONLY;
 //          abstract=False; final=False;
-// Particle: AppProtocol, AppProtocolType (1, 5) (original max 20);
+// Particle: AppProtocol, AppProtocolType (1, 20);
 static int encode_appHand_supportedAppProtocolReq(exi_bitstream_t* stream, const struct appHand_supportedAppProtocolReq* supportedAppProtocolReq) {
     int grammar_id = 7;
     int done = 0;
     int error = 0;
     uint16_t AppProtocol_currentIndex = 0;
+
+    /* Keep the generated encoder inside the schema-backed storage even when a
+     * caller constructs the document manually with an invalid arrayLen. */
+    if (supportedAppProtocolReq->AppProtocol.arrayLen == 0 ||
+        supportedAppProtocolReq->AppProtocol.arrayLen > appHand_AppProtocolType_20_ARRAY_SIZE)
+    {
+        return EXI_ERROR__ARRAY_OUT_OF_BOUNDS;
+    }
 
     while (!done)
     {
@@ -391,5 +399,4 @@ int encode_appHand_exiDocument(exi_bitstream_t* stream, struct appHand_exiDocume
 
     return error;
 }
-
 
