@@ -1026,11 +1026,6 @@ static bool secc_config_has_any_dc_mode(const jpv2g_secc_t *secc) {
            secc_config_has_energy_mode(secc, "DC_unique");
 }
 
-static bool secc_config_has_any_din_dc_mode(const jpv2g_secc_t *secc) {
-    return secc_config_has_energy_mode(secc, "DC_core") ||
-           secc_config_has_energy_mode(secc, "DC_extended");
-}
-
 static iso2_EnergyTransferModeType secc_select_iso_etm(const jpv2g_secc_t *secc) {
     if (secc_config_has_energy_mode(secc, "DC_core")) {
         return iso2_EnergyTransferModeType_DC_core;
@@ -1044,20 +1039,25 @@ static iso2_EnergyTransferModeType secc_select_iso_etm(const jpv2g_secc_t *secc)
     return iso2_EnergyTransferModeType_DC_core;
 }
 
-static din_EVSESupportedEnergyTransferType secc_select_din_etm(const jpv2g_secc_t *secc) {
+static bool secc_resolve_din_etm(const jpv2g_secc_t *secc,
+                                 din_EVSESupportedEnergyTransferType *resolved) {
     /* DIN ServiceDiscovery permits one EnergyTransferType, and DIN charging
      * profiles use DC_core (DC on Type-1/Type-2 core pins) or DC_extended (CCS
      * extended DC pins).  The generated shared enum also contains DC_dual, but
      * DIN 70121 does not permit that value.  This CCS DC stack therefore
      * prefers the physically truthful DC_extended when the generic config lists
-     * both; a core-pin implementation can configure DC_core only. */
+     * both; a core-pin implementation can configure DC_core only. Empty or
+     * non-DIN configuration is not silently converted into a capability. */
+    if (!secc || !resolved) return false;
     if (secc_config_has_energy_mode(secc, "DC_extended")) {
-        return din_EVSESupportedEnergyTransferType_DC_extended;
+        *resolved = din_EVSESupportedEnergyTransferType_DC_extended;
+        return true;
     }
     if (secc_config_has_energy_mode(secc, "DC_core")) {
-        return din_EVSESupportedEnergyTransferType_DC_core;
+        *resolved = din_EVSESupportedEnergyTransferType_DC_core;
+        return true;
     }
-    return din_EVSESupportedEnergyTransferType_DC_extended;
+    return false;
 }
 
 static bool secc_iso_etm_supported(const jpv2g_secc_t *secc,
@@ -1079,15 +1079,12 @@ static bool secc_iso_etm_supported(const jpv2g_secc_t *secc,
 
 static bool secc_din_etm_supported(const jpv2g_secc_t *secc,
                                    din_EVRequestedEnergyTransferType etm) {
-    switch (etm) {
-        case din_EVRequestedEnergyTransferType_DC_core:
-            return secc_config_has_energy_mode(secc, "DC_core");
-        case din_EVRequestedEnergyTransferType_DC_extended:
-            return secc_config_has_energy_mode(secc, "DC_extended") ||
-                   !secc_config_has_any_din_dc_mode(secc);
-        default:
-            return false;
+    if (!secc || !secc->din_advertised_energy_transfer_valid) return false;
+    if (etm != din_EVRequestedEnergyTransferType_DC_core &&
+        etm != din_EVRequestedEnergyTransferType_DC_extended) {
+        return false;
     }
+    return (uint8_t)etm == secc->din_advertised_energy_transfer_type;
 }
 
 static int secc_encode_iso_service_discovery_res_multi(
@@ -1281,6 +1278,10 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
                 schema, selection.response_code, out, out_len, written);
         }
         case JPV2G_SESSION_SETUP_REQ: {
+            /* A new or resumed V2G session must renegotiate its DIN offer.
+             * Never let a prior session's ServiceDiscovery contract leak. */
+            secc->din_advertised_energy_transfer_valid = false;
+            secc->din_advertised_energy_transfer_type = 0;
             if (req->protocol == JPV2G_PROTOCOL_DIN70121) {
                 din_responseCodeType code = old_session_joined
                                                 ? din_responseCodeType_OK_OldSessionJoined
@@ -1304,16 +1305,27 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
         case JPV2G_SERVICE_DISCOVERY_REQ: {
             int free_service = secc->evse_ctl.is_free_charging ? secc->evse_ctl.is_free_charging(secc->evse_ctl.user_ctx) : (secc->cfg.free_charging ? 1 : 0);
             if (req->protocol == JPV2G_PROTOCOL_DIN70121) {
-                return jpv2g_cbv2g_encode_din_service_discovery_res(sid,
-                                                                     din_responseCodeType_OK,
-                                                                     din_paymentOptionType_ExternalPayment,
-                                                                     secc_select_din_etm(secc),
-                                                                     1,
-                                                                     NULL,
-                                                                     free_service,
-                                                                     out,
-                                                                     out_len,
-                                                                     written);
+                din_EVSESupportedEnergyTransferType advertised =
+                    din_EVSESupportedEnergyTransferType_DC_extended;
+                const bool resolved = secc_resolve_din_etm(secc, &advertised);
+                secc->din_advertised_energy_transfer_valid = false;
+                secc->din_advertised_energy_transfer_type = 0;
+                const int rc = jpv2g_cbv2g_encode_din_service_discovery_res(
+                    sid,
+                    resolved ? din_responseCodeType_OK : din_responseCodeType_FAILED,
+                    din_paymentOptionType_ExternalPayment,
+                    advertised,
+                    1,
+                    NULL,
+                    free_service,
+                    out,
+                    out_len,
+                    written);
+                if (rc == 0 && resolved) {
+                    secc->din_advertised_energy_transfer_type = (uint8_t)advertised;
+                    secc->din_advertised_energy_transfer_valid = true;
+                }
+                return rc;
             }
             const iso2_paymentOptionType payments[1] = {iso2_paymentOptionType_ExternalPayment};
             iso2_EnergyTransferModeType etms[4];
@@ -1409,12 +1421,13 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
         }
         case JPV2G_CHARGE_PARAMETER_DISCOVERY_REQ: {
             if (req->protocol == JPV2G_PROTOCOL_DIN70121) {
-                din_responseCodeType code = din_responseCodeType_OK;
-                if (req->body) {
+                din_responseCodeType code =
+                    din_responseCodeType_FAILED_WrongEnergyTransferType;
+                if (req->body && secc->din_advertised_energy_transfer_valid) {
                     const struct din_ChargeParameterDiscoveryReqType *cpd =
                         (const struct din_ChargeParameterDiscoveryReqType *)req->body;
-                    if (!secc_din_etm_supported(secc, cpd->EVRequestedEnergyTransferType)) {
-                        code = din_responseCodeType_FAILED_WrongEnergyTransferType;
+                    if (secc_din_etm_supported(secc, cpd->EVRequestedEnergyTransferType)) {
+                        code = din_responseCodeType_OK;
                     }
                 }
                 return jpv2g_cbv2g_encode_din_charge_parameter_discovery_res(
@@ -1583,6 +1596,8 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
                 secc->last_session_end_ms = jpv2g_now_monotonic_ms();
             }
             memset(secc->session_id, 0, sizeof(secc->session_id));
+            secc->din_advertised_energy_transfer_valid = false;
+            secc->din_advertised_energy_transfer_type = 0;
             return rc;
         }
         default:
@@ -1727,6 +1742,8 @@ void jpv2g_secc_retire_session(jpv2g_secc_t *secc) {
      * last_session_id / last_session_end_ms (the SessionStop-Pause resume
      * memory) are deliberately preserved so a genuine pause can still resume. */
     memset(secc->session_id, 0, sizeof(secc->session_id));
+    secc->din_advertised_energy_transfer_valid = false;
+    secc->din_advertised_energy_transfer_type = 0;
 }
 
 /* Per-call observation state for handle_stream. Lives on the caller's

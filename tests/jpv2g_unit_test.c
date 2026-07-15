@@ -695,16 +695,55 @@ static int test_supported_app_protocol_interop(void) {
     return 0;
 }
 
+static int din_service_discovery(jpv2g_secc_t *secc,
+                                 jpv2g_secc_request_t *request,
+                                 struct din_ServiceDiscoveryReqType *discovery,
+                                 uint8_t *response,
+                                 size_t response_size,
+                                 struct din_exiDocument *decoded) {
+    size_t response_len = 0;
+    request->body = discovery;
+    int rc = jpv2g_secc_default_handle(secc,
+                                        JPV2G_SERVICE_DISCOVERY_REQ,
+                                        request,
+                                        response,
+                                        response_size,
+                                        &response_len);
+    if (rc != 0) return rc;
+    return decode_din_document(response, response_len, decoded);
+}
+
+static int din_charge_parameter_discovery(jpv2g_secc_t *secc,
+                                          jpv2g_secc_request_t *request,
+                                          din_EVRequestedEnergyTransferType requested,
+                                          uint8_t *response,
+                                          size_t response_size,
+                                          struct din_exiDocument *decoded) {
+    struct din_ChargeParameterDiscoveryReqType cpd;
+    size_t response_len = 0;
+    init_din_ChargeParameterDiscoveryReqType(&cpd);
+    cpd.EVRequestedEnergyTransferType = requested;
+    cpd.DC_EVChargeParameter_isUsed = 1;
+    init_din_DC_EVChargeParameterType(&cpd.DC_EVChargeParameter);
+    request->body = &cpd;
+    int rc = jpv2g_secc_default_handle(secc,
+                                        JPV2G_CHARGE_PARAMETER_DISCOVERY_REQ,
+                                        request,
+                                        response,
+                                        response_size,
+                                        &response_len);
+    if (rc != 0) return rc;
+    return decode_din_document(response, response_len, decoded);
+}
+
 static int test_din_dc_interop_responses(void) {
     static const uint8_t session_id[din_sessionIDType_BYTES_SIZE] =
         {0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80};
     uint8_t response[JPV2G_MAX_EXI_SIZE];
-    size_t response_len = 0;
     jpv2g_secc_t secc;
     jpv2g_secc_request_t request;
     struct din_MessageHeaderType header;
     struct din_ServiceDiscoveryReqType discovery;
-    struct din_ChargeParameterDiscoveryReqType cpd;
     struct din_exiDocument decoded;
 
     memset(&secc, 0, sizeof(secc));
@@ -719,50 +758,27 @@ static int test_din_dc_interop_responses(void) {
     request.din_header = &header;
     request.body = &discovery;
 
-    if (assert_true(jpv2g_secc_default_handle(&secc,
-                                              JPV2G_SERVICE_DISCOVERY_REQ,
-                                              &request,
-                                              response,
-                                              sizeof(response),
-                                              &response_len) == 0,
-                    "encode default DIN ServiceDiscovery") != 0) return 1;
-    if (assert_true(decode_din_document(response, response_len, &decoded) == 0 &&
-                        decoded.V2G_Message.Body.ServiceDiscoveryRes_isUsed,
-                    "decode default DIN ServiceDiscovery") != 0) return 1;
-    if (assert_true(decoded.V2G_Message.Body.ServiceDiscoveryRes.ChargeService.EnergyTransferType ==
-                            din_EVSESupportedEnergyTransferType_DC_extended,
-                    "CCS DIN ServiceDiscovery must advertise DC_extended") != 0) return 1;
-
-    strcpy(secc.cfg.supported_energy_modes, "DC_core");
-    response_len = 0;
-    if (assert_true(jpv2g_secc_default_handle(&secc,
-                                              JPV2G_SERVICE_DISCOVERY_REQ,
-                                              &request,
-                                              response,
-                                              sizeof(response),
-                                              &response_len) == 0,
-                    "encode core-only DIN ServiceDiscovery") != 0) return 1;
-    if (assert_true(decode_din_document(response, response_len, &decoded) == 0 &&
+    strcpy(secc.cfg.supported_energy_modes, "DC_extended");
+    if (assert_true(din_service_discovery(&secc,
+                                          &request,
+                                          &discovery,
+                                          response,
+                                          sizeof(response),
+                                          &decoded) == 0 &&
+                        decoded.V2G_Message.Body.ServiceDiscoveryRes_isUsed &&
+                        decoded.V2G_Message.Body.ServiceDiscoveryRes.ResponseCode ==
+                            din_responseCodeType_OK &&
                         decoded.V2G_Message.Body.ServiceDiscoveryRes.ChargeService.EnergyTransferType ==
-                            din_EVSESupportedEnergyTransferType_DC_core,
-                    "core-only hardware configuration must advertise DC_core") != 0) return 1;
-
-    jpv2g_secc_config_default(&secc.cfg);
-    init_din_ChargeParameterDiscoveryReqType(&cpd);
-    cpd.EVRequestedEnergyTransferType = din_EVRequestedEnergyTransferType_DC_core;
-    cpd.DC_EVChargeParameter_isUsed = 1;
-    init_din_DC_EVChargeParameterType(&cpd.DC_EVChargeParameter);
-    request.body = &cpd;
-    response_len = 0;
-    if (assert_true(jpv2g_secc_default_handle(&secc,
-                                              JPV2G_CHARGE_PARAMETER_DISCOVERY_REQ,
-                                              &request,
-                                              response,
-                                              sizeof(response),
-                                              &response_len) == 0,
-                    "encode DIN DC_core CPD response") != 0) return 1;
-    if (assert_true(decode_din_document(response, response_len, &decoded) == 0,
-                    "decode DIN DC_core CPD response") != 0) return 1;
+                            din_EVSESupportedEnergyTransferType_DC_extended,
+                    "extended-only DIN configuration must advertise DC_extended") != 0) return 1;
+    if (assert_true(din_charge_parameter_discovery(
+                        &secc,
+                        &request,
+                        din_EVRequestedEnergyTransferType_DC_extended,
+                        response,
+                        sizeof(response),
+                        &decoded) == 0,
+                    "decode extended-only DIN CPD response") != 0) return 1;
     struct din_ChargeParameterDiscoveryResType *cpd_res =
         &decoded.V2G_Message.Body.ChargeParameterDiscoveryRes;
     if (assert_true(decoded.V2G_Message.Body.ChargeParameterDiscoveryRes_isUsed &&
@@ -779,34 +795,125 @@ static int test_din_dc_interop_responses(void) {
                         tuple->PMaxSchedule.PMaxScheduleEntry.array[0].RelativeTimeInterval.duration == 86400 &&
                         tuple->PMaxSchedule.PMaxScheduleEntry.array[0].PMax == 32767,
                     "DIN schedule IDs, interval and PMax must be deterministic") != 0) return 1;
+    if (assert_true(din_charge_parameter_discovery(
+                        &secc,
+                        &request,
+                        din_EVRequestedEnergyTransferType_DC_core,
+                        response,
+                        sizeof(response),
+                        &decoded) == 0 &&
+                        decoded.V2G_Message.Body.ChargeParameterDiscoveryRes.ResponseCode ==
+                            din_responseCodeType_FAILED_WrongEnergyTransferType,
+                    "extended-only DIN offer must reject DC_core CPD") != 0) return 1;
 
-    cpd.EVRequestedEnergyTransferType = din_EVRequestedEnergyTransferType_DC_extended;
-    response_len = 0;
-    if (assert_true(jpv2g_secc_default_handle(&secc,
-                                              JPV2G_CHARGE_PARAMETER_DISCOVERY_REQ,
-                                              &request,
-                                              response,
-                                              sizeof(response),
-                                              &response_len) == 0 &&
-                        decode_din_document(response, response_len, &decoded) == 0 &&
+    strcpy(secc.cfg.supported_energy_modes, "DC_core");
+    if (assert_true(din_service_discovery(&secc,
+                                          &request,
+                                          &discovery,
+                                          response,
+                                          sizeof(response),
+                                          &decoded) == 0 &&
+                        decoded.V2G_Message.Body.ServiceDiscoveryRes.ResponseCode ==
+                            din_responseCodeType_OK &&
+                        decoded.V2G_Message.Body.ServiceDiscoveryRes.ChargeService.EnergyTransferType ==
+                            din_EVSESupportedEnergyTransferType_DC_core,
+                    "core-only DIN configuration must advertise DC_core") != 0) return 1;
+    if (assert_true(din_charge_parameter_discovery(
+                        &secc,
+                        &request,
+                        din_EVRequestedEnergyTransferType_DC_core,
+                        response,
+                        sizeof(response),
+                        &decoded) == 0 &&
                         decoded.V2G_Message.Body.ChargeParameterDiscoveryRes.ResponseCode ==
                             din_responseCodeType_OK,
-                    "configured DIN DC_extended request must remain accepted") != 0) return 1;
+                    "core-only DIN offer must accept DC_core CPD") != 0) return 1;
+    if (assert_true(din_charge_parameter_discovery(
+                        &secc,
+                        &request,
+                        din_EVRequestedEnergyTransferType_DC_extended,
+                        response,
+                        sizeof(response),
+                        &decoded) == 0 &&
+                        decoded.V2G_Message.Body.ChargeParameterDiscoveryRes.ResponseCode ==
+                            din_responseCodeType_FAILED_WrongEnergyTransferType,
+                    "core-only DIN offer must reject DC_extended CPD") != 0) return 1;
 
-    cpd.EVRequestedEnergyTransferType = din_EVRequestedEnergyTransferType_AC_single_phase_core;
-    response_len = 0;
-    if (assert_true(jpv2g_secc_default_handle(&secc,
-                                              JPV2G_CHARGE_PARAMETER_DISCOVERY_REQ,
-                                              &request,
-                                              response,
-                                              sizeof(response),
-                                              &response_len) == 0 &&
-                        decode_din_document(response, response_len, &decoded) == 0 &&
+    strcpy(secc.cfg.supported_energy_modes, "DC_core,DC_extended");
+    if (assert_true(din_service_discovery(&secc,
+                                          &request,
+                                          &discovery,
+                                          response,
+                                          sizeof(response),
+                                          &decoded) == 0 &&
+                        decoded.V2G_Message.Body.ServiceDiscoveryRes.ResponseCode ==
+                            din_responseCodeType_OK &&
+                        decoded.V2G_Message.Body.ServiceDiscoveryRes.ChargeService.EnergyTransferType ==
+                            din_EVSESupportedEnergyTransferType_DC_extended,
+                    "dual-listed DIN config must resolve its single offer to DC_extended") != 0) return 1;
+    strcpy(secc.cfg.supported_energy_modes, "DC_core");
+    if (assert_true(din_charge_parameter_discovery(
+                        &secc,
+                        &request,
+                        din_EVRequestedEnergyTransferType_DC_core,
+                        response,
+                        sizeof(response),
+                        &decoded) == 0 &&
+                        decoded.V2G_Message.Body.ChargeParameterDiscoveryRes.ResponseCode ==
+                            din_responseCodeType_FAILED_WrongEnergyTransferType,
+                    "DIN CPD must reject a generic-list mode not encoded in ServiceDiscovery") != 0) return 1;
+    if (assert_true(din_charge_parameter_discovery(
+                        &secc,
+                        &request,
+                        din_EVRequestedEnergyTransferType_DC_extended,
+                        response,
+                        sizeof(response),
+                        &decoded) == 0 &&
+                        decoded.V2G_Message.Body.ChargeParameterDiscoveryRes.ResponseCode ==
+                            din_responseCodeType_OK,
+                    "DIN CPD must retain the exact encoded offer despite later config mutation") != 0) return 1;
+
+    secc.cfg.supported_energy_modes[0] = '\0';
+    if (assert_true(din_service_discovery(&secc,
+                                          &request,
+                                          &discovery,
+                                          response,
+                                          sizeof(response),
+                                          &decoded) == 0 &&
+                        decoded.V2G_Message.Body.ServiceDiscoveryRes.ResponseCode ==
+                            din_responseCodeType_FAILED &&
+                        !secc.din_advertised_energy_transfer_valid,
+                    "empty DIN mode config must fail ServiceDiscovery closed") != 0) return 1;
+    if (assert_true(din_charge_parameter_discovery(
+                        &secc,
+                        &request,
+                        din_EVRequestedEnergyTransferType_DC_extended,
+                        response,
+                        sizeof(response),
+                        &decoded) == 0 &&
+                        decoded.V2G_Message.Body.ChargeParameterDiscoveryRes.ResponseCode ==
+                            din_responseCodeType_FAILED_WrongEnergyTransferType,
+                    "CPD must fail closed when no DIN mode was advertised") != 0) return 1;
+
+    strcpy(secc.cfg.supported_energy_modes, "DC_extended");
+    if (assert_true(din_service_discovery(&secc,
+                                          &request,
+                                          &discovery,
+                                          response,
+                                          sizeof(response),
+                                          &decoded) == 0 &&
+                        din_charge_parameter_discovery(
+                            &secc,
+                            &request,
+                            din_EVRequestedEnergyTransferType_AC_single_phase_core,
+                            response,
+                            sizeof(response),
+                            &decoded) == 0 &&
                         decoded.V2G_Message.Body.ChargeParameterDiscoveryRes.ResponseCode ==
                             din_responseCodeType_FAILED_WrongEnergyTransferType,
                     "DC-only hardware must reject a DIN AC transfer request cleanly") != 0) return 1;
 
-    response_len = 0;
+    size_t response_len = 0;
     if (assert_true(jpv2g_cbv2g_encode_din_charge_parameter_discovery_res(
                         session_id,
                         din_responseCodeType_OK,
@@ -820,6 +927,105 @@ static int test_din_dc_interop_responses(void) {
     cpd_res = &decoded.V2G_Message.Body.ChargeParameterDiscoveryRes;
     if (assert_true(!cpd_res->SAScheduleList_isUsed && cpd_res->SASchedules_isUsed,
                     "DIN Ongoing CPD must omit the concrete Finished-only schedule") != 0) return 1;
+    return 0;
+}
+
+static int iso_charge_parameter_discovery(jpv2g_secc_t *secc,
+                                          jpv2g_secc_request_t *request,
+                                          iso2_EnergyTransferModeType requested,
+                                          uint8_t *response,
+                                          size_t response_size,
+                                          struct iso2_ChargeParameterDiscoveryResType *decoded) {
+    struct iso2_ChargeParameterDiscoveryReqType cpd;
+    size_t response_len = 0;
+    init_iso2_ChargeParameterDiscoveryReqType(&cpd);
+    cpd.RequestedEnergyTransferMode = requested;
+    cpd.DC_EVChargeParameter_isUsed = 1;
+    init_iso2_DC_EVChargeParameterType(&cpd.DC_EVChargeParameter);
+    request->body = &cpd;
+    int rc = jpv2g_secc_default_handle(secc,
+                                        JPV2G_CHARGE_PARAMETER_DISCOVERY_REQ,
+                                        request,
+                                        response,
+                                        response_size,
+                                        &response_len);
+    if (rc != 0) return rc;
+    return jpv2g_cbv2g_decode_charge_parameter_discovery_res(
+        response, response_len, decoded);
+}
+
+static int test_iso_energy_mode_membership(void) {
+    static const uint8_t session_id[iso2_sessionIDType_BYTES_SIZE] =
+        {0x31, 0x42, 0x53, 0x64, 0x75, 0x86, 0x97, 0xA8};
+    uint8_t response[JPV2G_MAX_EXI_SIZE];
+    size_t response_len = 0;
+    jpv2g_secc_t secc;
+    jpv2g_secc_request_t request;
+    struct iso2_MessageHeaderType header;
+    struct iso2_ServiceDiscoveryReqType discovery;
+    struct iso2_ServiceDiscoveryResType discovery_res;
+    struct iso2_ChargeParameterDiscoveryResType cpd_res;
+
+    memset(&secc, 0, sizeof(secc));
+    memset(&request, 0, sizeof(request));
+    jpv2g_secc_config_default(&secc.cfg);
+    strcpy(secc.cfg.supported_energy_modes, "DC_core,DC_extended");
+    memcpy(secc.session_id, session_id, sizeof(session_id));
+    init_iso2_MessageHeaderType(&header);
+    memcpy(header.SessionID.bytes, session_id, sizeof(session_id));
+    header.SessionID.bytesLen = sizeof(session_id);
+    init_iso2_ServiceDiscoveryReqType(&discovery);
+    request.protocol = JPV2G_PROTOCOL_ISO15118_2;
+    request.header = &header;
+    request.body = &discovery;
+
+    if (assert_true(jpv2g_secc_default_handle(&secc,
+                                              JPV2G_SERVICE_DISCOVERY_REQ,
+                                              &request,
+                                              response,
+                                              sizeof(response),
+                                              &response_len) == 0 &&
+                        jpv2g_cbv2g_decode_service_discovery_res(
+                            response, response_len, &discovery_res) == 0 &&
+                        discovery_res.ResponseCode == iso2_responseCodeType_OK &&
+                        discovery_res.ChargeService.SupportedEnergyTransferMode
+                                .EnergyTransferMode.arrayLen == 2 &&
+                        discovery_res.ChargeService.SupportedEnergyTransferMode
+                                .EnergyTransferMode.array[0] ==
+                            iso2_EnergyTransferModeType_DC_core &&
+                        discovery_res.ChargeService.SupportedEnergyTransferMode
+                                .EnergyTransferMode.array[1] ==
+                            iso2_EnergyTransferModeType_DC_extended,
+                    "ISO ServiceDiscovery must retain multi-mode membership") != 0) return 1;
+
+    if (assert_true(iso_charge_parameter_discovery(
+                        &secc,
+                        &request,
+                        iso2_EnergyTransferModeType_DC_core,
+                        response,
+                        sizeof(response),
+                        &cpd_res) == 0 &&
+                        cpd_res.ResponseCode == iso2_responseCodeType_OK,
+                    "ISO CPD must accept advertised DC_core membership") != 0) return 1;
+    if (assert_true(iso_charge_parameter_discovery(
+                        &secc,
+                        &request,
+                        iso2_EnergyTransferModeType_DC_extended,
+                        response,
+                        sizeof(response),
+                        &cpd_res) == 0 &&
+                        cpd_res.ResponseCode == iso2_responseCodeType_OK,
+                    "ISO CPD must accept advertised DC_extended membership") != 0) return 1;
+    if (assert_true(iso_charge_parameter_discovery(
+                        &secc,
+                        &request,
+                        iso2_EnergyTransferModeType_DC_combo_core,
+                        response,
+                        sizeof(response),
+                        &cpd_res) == 0 &&
+                        cpd_res.ResponseCode ==
+                            iso2_responseCodeType_FAILED_WrongEnergyTransferMode,
+                    "ISO CPD must reject an unadvertised transfer mode") != 0) return 1;
     return 0;
 }
 
@@ -1411,6 +1617,7 @@ int main(void) {
 #ifdef JPV2G_ENABLE_CBV2G_CODEC
     if (test_supported_app_protocol_interop() != 0) return 1;
     if (test_din_dc_interop_responses() != 0) return 1;
+    if (test_iso_energy_mode_membership() != 0) return 1;
     if (test_iso_dc_transition_response_round_trip() != 0) return 1;
     if (test_din_dc_transition_response_round_trip() != 0) return 1;
     if (test_iso_pause_resume() != 0) return 1;

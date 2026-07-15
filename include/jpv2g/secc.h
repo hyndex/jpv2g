@@ -98,6 +98,13 @@ typedef struct {
      * the jpv2g_secc_init() memset. */
     uint8_t last_session_id[8];
     int64_t last_session_end_ms;
+    /* DIN 70121 ServiceDiscovery carries exactly one EnergyTransferType.
+     * Keep the successfully encoded value as a per-session contract so CPD
+     * cannot accept a different mode merely because it also appears in the
+     * generic supported_energy_modes list. Stored as a byte to keep this
+     * public header independent of the optional generated cbv2g headers. */
+    uint8_t din_advertised_energy_transfer_type;
+    bool din_advertised_energy_transfer_valid;
     int64_t meter_Wh;
     char meter_id[16];
     /* Callbacks to build responses based on decoded requests. */
