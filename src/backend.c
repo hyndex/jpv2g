@@ -11,12 +11,15 @@
 
 static bool default_authorize_contract(void *user_ctx) {
     (void)user_ctx;
-    return true;
+    /* Authorization is a site/application decision.  A caller that has not
+     * installed a backend must never inherit permission to energize merely by
+     * using the library defaults. */
+    return false;
 }
 
 static bool default_authorize_external(void *user_ctx) {
     (void)user_ctx;
-    return true;
+    return false;
 }
 
 void jpv2g_backend_set_defaults(jpv2g_backend_t *backend) {

@@ -20,10 +20,14 @@
 #include "cbv2g/iso_2/iso2_msgDefDecoder.h"
 #include "cbv2g/iso_2/iso2_msgDefEncoder.h"
 #include "jpv2g/byte_utils.h"
+#include "cbv2g_workspace.h"
 
 #include <stdlib.h>
 #if defined(ESP_PLATFORM)
 #include <esp_heap_caps.h>
+#if defined(BOARD_HAS_PSRAM)
+#include <soc/soc_memory_types.h>
+#endif
 #endif
 
 // The ISO-15118 / DIN / app message documents are large (iso2 ~24 KB, din ~11 KB,
@@ -32,21 +36,31 @@
 // precompiled Arduino SDK does not enable BSS-in-PSRAM
 // (CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is off), so EXT_RAM_ATTR silently
 // fell back to internal .dram0.bss — pinning ~35 KB of scarce internal SRAM. We
-// instead allocate them from PSRAM at RUNTIME (PSRAM-first with an internal
-// fallback, so a board without PSRAM still works), realizing the intended
-// placement and freeing ~35 KB of internal SRAM. Allocated lazily on first use
-// (callers need no init) and optionally pre-warmed at boot by
-// jpv2g_cbv2g_codec_init(). Allocated once, reused for every message, never freed
-// (process-lifetime) — so no fragmentation.
+// instead allocate three independent document sets at RUNTIME: encoder,
+// request-decoder, and optional decoded-response logging.  They are allocated
+// once, reused for every message, and never freed (process lifetime), so they
+// cannot fragment either heap or outlive the storage backing a decoded request.
 static struct appHand_exiDocument *g_app_doc_psram = NULL;
 static struct iso2_exiDocument *g_iso_doc_psram = NULL;
 static struct din_exiDocument *g_din_doc_psram = NULL;
+static struct appHand_exiDocument *g_secc_request_app_doc_psram = NULL;
+static struct iso2_exiDocument *g_secc_request_iso_doc_psram = NULL;
+static struct din_exiDocument *g_secc_request_din_doc_psram = NULL;
+static struct appHand_exiDocument *g_secc_log_app_doc_psram = NULL;
+static struct iso2_exiDocument *g_secc_log_iso_doc_psram = NULL;
+static struct din_exiDocument *g_secc_log_din_doc_psram = NULL;
 
-// PSRAM-first, internal fallback. Zeroed (calloc) so a fresh document starts clean.
+// Zeroed so a fresh document starts clean.  A shipping ESP32 build declares
+// BOARD_HAS_PSRAM and must never fall back to internal SRAM: doing so can steal
+// the only contiguous block from the HLC/control task stacks.  Generic ESP32
+// library builds retain the historical internal fallback; host tests use
+// ordinary calloc.
 static void *jpv2g_doc_alloc(size_t sz) {
 #if defined(ESP_PLATFORM)
     void *p = heap_caps_calloc(1, sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!p) p = heap_caps_calloc(1, sz, MALLOC_CAP_8BIT);   // no PSRAM → internal
+#if !defined(BOARD_HAS_PSRAM)
+    if (!p) p = heap_caps_calloc(1, sz, MALLOC_CAP_8BIT);
+#endif
     return p;
 #else
     return calloc(1, sz);
@@ -66,15 +80,112 @@ static struct din_exiDocument *din_doc(void) {
     return g_din_doc_psram;
 }
 
+struct appHand_exiDocument *jpv2g_cbv2g_encode_app_workspace(void) {
+    return app_doc();
+}
+
+struct iso2_exiDocument *jpv2g_cbv2g_encode_iso_workspace(void) {
+    return iso_doc();
+}
+
+struct din_exiDocument *jpv2g_cbv2g_encode_din_workspace(void) {
+    return din_doc();
+}
+
+struct appHand_exiDocument *jpv2g_cbv2g_secc_request_app_workspace(void) {
+    if (!g_secc_request_app_doc_psram) {
+        g_secc_request_app_doc_psram =
+            jpv2g_doc_alloc(sizeof(*g_secc_request_app_doc_psram));
+    }
+    return g_secc_request_app_doc_psram;
+}
+
+struct iso2_exiDocument *jpv2g_cbv2g_secc_request_iso_workspace(void) {
+    if (!g_secc_request_iso_doc_psram) {
+        g_secc_request_iso_doc_psram =
+            jpv2g_doc_alloc(sizeof(*g_secc_request_iso_doc_psram));
+    }
+    return g_secc_request_iso_doc_psram;
+}
+
+struct din_exiDocument *jpv2g_cbv2g_secc_request_din_workspace(void) {
+    if (!g_secc_request_din_doc_psram) {
+        g_secc_request_din_doc_psram =
+            jpv2g_doc_alloc(sizeof(*g_secc_request_din_doc_psram));
+    }
+    return g_secc_request_din_doc_psram;
+}
+
+struct appHand_exiDocument *jpv2g_cbv2g_secc_log_app_workspace(void) {
+    if (!g_secc_log_app_doc_psram) {
+        g_secc_log_app_doc_psram =
+            jpv2g_doc_alloc(sizeof(*g_secc_log_app_doc_psram));
+    }
+    return g_secc_log_app_doc_psram;
+}
+
+struct iso2_exiDocument *jpv2g_cbv2g_secc_log_iso_workspace(void) {
+    if (!g_secc_log_iso_doc_psram) {
+        g_secc_log_iso_doc_psram =
+            jpv2g_doc_alloc(sizeof(*g_secc_log_iso_doc_psram));
+    }
+    return g_secc_log_iso_doc_psram;
+}
+
+struct din_exiDocument *jpv2g_cbv2g_secc_log_din_workspace(void) {
+    if (!g_secc_log_din_doc_psram) {
+        g_secc_log_din_doc_psram =
+            jpv2g_doc_alloc(sizeof(*g_secc_log_din_doc_psram));
+    }
+    return g_secc_log_din_doc_psram;
+}
+
+void jpv2g_cbv2g_workspace_init(void) {
+    (void)jpv2g_cbv2g_encode_app_workspace();
+    (void)jpv2g_cbv2g_encode_iso_workspace();
+    (void)jpv2g_cbv2g_encode_din_workspace();
+    (void)jpv2g_cbv2g_secc_request_app_workspace();
+    (void)jpv2g_cbv2g_secc_request_iso_workspace();
+    (void)jpv2g_cbv2g_secc_request_din_workspace();
+    (void)jpv2g_cbv2g_secc_log_app_workspace();
+    (void)jpv2g_cbv2g_secc_log_iso_workspace();
+    (void)jpv2g_cbv2g_secc_log_din_workspace();
+}
+
+static bool jpv2g_workspace_pointer_ready(const void *workspace) {
+    if (!workspace) return false;
+#if defined(ESP_PLATFORM) && defined(BOARD_HAS_PSRAM)
+    /* Shipping builds must prove placement, not infer it from the requested
+     * heap capability. This prevents a framework/configuration regression
+     * from silently consuming the internal-RAM reserve needed by RTOS tasks. */
+    return esp_ptr_external_ram(workspace);
+#else
+    return true;
+#endif
+}
+
+bool jpv2g_cbv2g_workspace_ready(void) {
+    return jpv2g_workspace_pointer_ready(g_app_doc_psram) &&
+           jpv2g_workspace_pointer_ready(g_iso_doc_psram) &&
+           jpv2g_workspace_pointer_ready(g_din_doc_psram) &&
+           jpv2g_workspace_pointer_ready(g_secc_request_app_doc_psram) &&
+           jpv2g_workspace_pointer_ready(g_secc_request_iso_doc_psram) &&
+           jpv2g_workspace_pointer_ready(g_secc_request_din_doc_psram) &&
+           jpv2g_workspace_pointer_ready(g_secc_log_app_doc_psram) &&
+           jpv2g_workspace_pointer_ready(g_secc_log_iso_doc_psram) &&
+           jpv2g_workspace_pointer_ready(g_secc_log_din_doc_psram);
+}
+
 // Optional: pre-allocate the documents at boot (off the HLC timing path) instead
 // of lazily on the first V2G message. Safe to call more than once.
-void jpv2g_cbv2g_codec_init(void) { (void)app_doc(); (void)iso_doc(); (void)din_doc(); }
+void jpv2g_cbv2g_codec_init(void) { jpv2g_cbv2g_workspace_init(); }
 
-// True once all three documents are allocated. The HLC bring-up gates on this so
-// a heap-starved allocation surfaces as a clean init failure (with backoff and a
-// structured fault) instead of a NULL deref on the first V2G message.
+// True once all three independent document sets (nine documents) are
+// allocated. The HLC
+// bring-up gates on this so a heap-starved allocation surfaces as a clean init
+// failure instead of a NULL dereference on the first V2G message.
 bool jpv2g_cbv2g_codec_ready(void) {
-    return g_app_doc_psram != NULL && g_iso_doc_psram != NULL && g_din_doc_psram != NULL;
+    return jpv2g_cbv2g_workspace_ready();
 }
 
 static uint16_t copy_chars(char *dst, size_t dst_size, const char *src) {
@@ -481,18 +592,25 @@ int jpv2g_cbv2g_decode_service_discovery_req(const uint8_t *buf, size_t len, str
     return 0;
 }
 
-int jpv2g_cbv2g_encode_service_discovery_res(const uint8_t session_id[iso2_sessionIDType_BYTES_SIZE],
-                                               iso2_responseCodeType code,
-                                               iso2_paymentOptionType payment,
-                                               iso2_EnergyTransferModeType etm,
-                                               uint16_t service_id,
-                                               const char *service_name,
-                                               int free_service,
-                                               uint8_t *out,
-                                               size_t out_len,
-                                               size_t *written) {
-    if (!out) return -EINVAL;
+int jpv2g_cbv2g_encode_service_discovery_res_multi(
+    const uint8_t session_id[iso2_sessionIDType_BYTES_SIZE],
+    iso2_responseCodeType code,
+    const iso2_paymentOptionType *payments,
+    size_t payment_count,
+    const iso2_EnergyTransferModeType *energy_modes,
+    size_t energy_mode_count,
+    uint16_t service_id,
+    const char *service_name,
+    int free_service,
+    uint8_t *out,
+    size_t out_len,
+    size_t *written) {
+    if (!payments || payment_count == 0u || !energy_modes ||
+        energy_mode_count == 0u || !out) {
+        return -EINVAL;
+    }
     struct iso2_exiDocument *doc = iso_doc();
+    if (!doc) return -ENOMEM;
     init_iso2_exiDocument(doc);
     set_header_session(&doc->V2G_Message.Header, session_id);
     init_iso2_BodyType(&doc->V2G_Message.Body);
@@ -501,16 +619,31 @@ int jpv2g_cbv2g_encode_service_discovery_res(const uint8_t session_id[iso2_sessi
     doc->V2G_Message.Body.ServiceDiscoveryRes.ResponseCode = code;
     /* Payment option list */
     init_iso2_PaymentOptionListType(&doc->V2G_Message.Body.ServiceDiscoveryRes.PaymentOptionList);
-    doc->V2G_Message.Body.ServiceDiscoveryRes.PaymentOptionList.PaymentOption.arrayLen = 1;
-    doc->V2G_Message.Body.ServiceDiscoveryRes.PaymentOptionList.PaymentOption.array[0] = payment;
+    const size_t payment_limit = iso2_paymentOptionType_2_ARRAY_SIZE;
+    const size_t payments_to_copy =
+        payment_count > payment_limit ? payment_limit : payment_count;
+    doc->V2G_Message.Body.ServiceDiscoveryRes.PaymentOptionList.PaymentOption.arrayLen =
+        (uint16_t)payments_to_copy;
+    for (size_t i = 0; i < payments_to_copy; ++i) {
+        doc->V2G_Message.Body.ServiceDiscoveryRes.PaymentOptionList.PaymentOption.array[i] =
+            payments[i];
+    }
     /* Charge service */
     init_iso2_ChargeServiceType(&doc->V2G_Message.Body.ServiceDiscoveryRes.ChargeService);
     doc->V2G_Message.Body.ServiceDiscoveryRes.ChargeService.ServiceID = service_id;
     doc->V2G_Message.Body.ServiceDiscoveryRes.ChargeService.ServiceCategory = iso2_serviceCategoryType_EVCharging;
     doc->V2G_Message.Body.ServiceDiscoveryRes.ChargeService.FreeService = free_service ? 1 : 0;
     init_iso2_SupportedEnergyTransferModeType(&doc->V2G_Message.Body.ServiceDiscoveryRes.ChargeService.SupportedEnergyTransferMode);
-    doc->V2G_Message.Body.ServiceDiscoveryRes.ChargeService.SupportedEnergyTransferMode.EnergyTransferMode.arrayLen = 1;
-    doc->V2G_Message.Body.ServiceDiscoveryRes.ChargeService.SupportedEnergyTransferMode.EnergyTransferMode.array[0] = etm;
+    const size_t energy_mode_limit = iso2_EnergyTransferModeType_6_ARRAY_SIZE;
+    const size_t energy_modes_to_copy =
+        energy_mode_count > energy_mode_limit ? energy_mode_limit
+                                              : energy_mode_count;
+    doc->V2G_Message.Body.ServiceDiscoveryRes.ChargeService.SupportedEnergyTransferMode.EnergyTransferMode.arrayLen =
+        (uint16_t)energy_modes_to_copy;
+    for (size_t i = 0; i < energy_modes_to_copy; ++i) {
+        doc->V2G_Message.Body.ServiceDiscoveryRes.ChargeService.SupportedEnergyTransferMode.EnergyTransferMode.array[i] =
+            energy_modes[i];
+    }
     if (service_name) {
         size_t sn_len = strnlen(service_name, iso2_ServiceName_CHARACTER_SIZE - 1);
         memcpy(doc->V2G_Message.Body.ServiceDiscoveryRes.ChargeService.ServiceName.characters, service_name, sn_len);
@@ -525,6 +658,22 @@ int jpv2g_cbv2g_encode_service_discovery_res(const uint8_t session_id[iso2_sessi
     if (encode_iso2_exiDocument(&stream, doc) != 0) return -EIO;
     if (written) *written = exi_bitstream_get_length(&stream);
     return 0;
+}
+
+int jpv2g_cbv2g_encode_service_discovery_res(
+    const uint8_t session_id[iso2_sessionIDType_BYTES_SIZE],
+    iso2_responseCodeType code,
+    iso2_paymentOptionType payment,
+    iso2_EnergyTransferModeType etm,
+    uint16_t service_id,
+    const char *service_name,
+    int free_service,
+    uint8_t *out,
+    size_t out_len,
+    size_t *written) {
+    return jpv2g_cbv2g_encode_service_discovery_res_multi(
+        session_id, code, &payment, 1u, &etm, 1u, service_id,
+        service_name, free_service, out, out_len, written);
 }
 
 int jpv2g_cbv2g_decode_service_discovery_res(const uint8_t *buf, size_t len, struct iso2_ServiceDiscoveryResType *res) {

@@ -34,6 +34,7 @@
 #include "jpv2g/v2gtp.h"
 #include "jpv2g/log.h"
 #include "jpv2g/time_compat.h"
+#include "cbv2g_workspace.h"
 
 static bool s_enable_decoded_logs = true;
 static bool s_enable_timing_logs = true;
@@ -493,11 +494,14 @@ static void secc_log_decoded_app(jpv2g_message_type_t mtype,
     const struct appHand_supportedAppProtocolReq *app =
         (const struct appHand_supportedAppProtocolReq *)req->body;
 
-    struct appHand_exiDocument res_doc;
-    init_appHand_exiDocument(&res_doc);
+    struct appHand_exiDocument *res_doc =
+        jpv2g_cbv2g_secc_log_app_workspace();
+    if (!res_doc) return;
+    init_appHand_exiDocument(res_doc);
     exi_bitstream_t stream;
     exi_bitstream_init(&stream, (uint8_t *)out_payload, out_len, 0, NULL);
-    if (decode_appHand_exiDocument(&stream, &res_doc) != 0 || !res_doc.supportedAppProtocolRes_isUsed) {
+    if (decode_appHand_exiDocument(&stream, res_doc) != 0 ||
+        !res_doc->supportedAppProtocolRes_isUsed) {
         return;
     }
 
@@ -526,8 +530,8 @@ static void secc_log_decoded_app(jpv2g_message_type_t mtype,
 
     JPV2G_INFO("DECODED {\"msg\":\"SupportedAppProtocol\",\"req\":{\"protocols\":[%s]},\"res\":{\"responseCode\":%u,\"schema\":%u}}",
                offered,
-               (unsigned)res_doc.supportedAppProtocolRes.ResponseCode,
-               (unsigned)res_doc.supportedAppProtocolRes.SchemaID);
+               (unsigned)res_doc->supportedAppProtocolRes.ResponseCode,
+               (unsigned)res_doc->supportedAppProtocolRes.SchemaID);
 }
 
 static void secc_log_decoded_iso(jpv2g_message_type_t mtype,
@@ -538,12 +542,14 @@ static void secc_log_decoded_iso(jpv2g_message_type_t mtype,
     if (!req || !req->body) return;
     if (mtype == JPV2G_SESSION_SETUP_REQ) s_iso_current_demand_loop = 0;
 
-    struct iso2_exiDocument res_doc;
-    init_iso2_exiDocument(&res_doc);
+    struct iso2_exiDocument *res_doc =
+        jpv2g_cbv2g_secc_log_iso_workspace();
+    if (!res_doc) return;
+    init_iso2_exiDocument(res_doc);
     exi_bitstream_t out_stream;
     exi_bitstream_init(&out_stream, (uint8_t *)out_payload, out_len, 0, NULL);
-    if (decode_iso2_exiDocument(&out_stream, &res_doc) != 0) return;
-    const struct iso2_BodyType *rb = &res_doc.V2G_Message.Body;
+    if (decode_iso2_exiDocument(&out_stream, res_doc) != 0) return;
+    const struct iso2_BodyType *rb = &res_doc->V2G_Message.Body;
 
     switch (mtype) {
         case JPV2G_SESSION_SETUP_REQ: {
@@ -552,8 +558,8 @@ static void secc_log_decoded_iso(jpv2g_message_type_t mtype,
             char evcc_hex[(iso2_evccIDType_BYTES_SIZE * 2) + 1];
             char sid_hex[(iso2_sessionIDType_BYTES_SIZE * 2) + 1];
             if (jpv2g_bytes_to_hex(rq->EVCCID.bytes, rq->EVCCID.bytesLen, evcc_hex, sizeof(evcc_hex)) != 0) strcpy(evcc_hex, "");
-            if (jpv2g_bytes_to_hex(res_doc.V2G_Message.Header.SessionID.bytes,
-                                   res_doc.V2G_Message.Header.SessionID.bytesLen,
+            if (jpv2g_bytes_to_hex(res_doc->V2G_Message.Header.SessionID.bytes,
+                                   res_doc->V2G_Message.Header.SessionID.bytesLen,
                                    sid_hex,
                                    sizeof(sid_hex)) != 0) strcpy(sid_hex, "");
             JPV2G_INFO("DECODED ISO {\"msg\":\"SessionSetup\",\"req\":{\"evccId\":\"%s\"},\"res\":{\"responseCode\":\"%s\",\"evseId\":\"%.*s\",\"sessionId\":\"%s\"}}",
@@ -749,12 +755,14 @@ static void secc_log_decoded_din(jpv2g_message_type_t mtype,
     if (!req || !req->body) return;
     if (mtype == JPV2G_SESSION_SETUP_REQ) s_din_current_demand_loop = 0;
 
-    struct din_exiDocument res_doc;
-    init_din_exiDocument(&res_doc);
+    struct din_exiDocument *res_doc =
+        jpv2g_cbv2g_secc_log_din_workspace();
+    if (!res_doc) return;
+    init_din_exiDocument(res_doc);
     exi_bitstream_t out_stream;
     exi_bitstream_init(&out_stream, (uint8_t *)out_payload, out_len, 0, NULL);
-    if (decode_din_exiDocument(&out_stream, &res_doc) != 0) return;
-    const struct din_BodyType *rb = &res_doc.V2G_Message.Body;
+    if (decode_din_exiDocument(&out_stream, res_doc) != 0) return;
+    const struct din_BodyType *rb = &res_doc->V2G_Message.Body;
 
     switch (mtype) {
         case JPV2G_CHARGE_PARAMETER_DISCOVERY_REQ: {
@@ -1100,52 +1108,9 @@ static int secc_encode_iso_service_discovery_res_multi(
     uint8_t *out,
     size_t out_len,
     size_t *written) {
-    if (!session_id || !payments || payment_count == 0 || !etm || etm_count == 0 || !out) return -EINVAL;
-    struct iso2_exiDocument doc;
-    init_iso2_exiDocument(&doc);
-    init_iso2_MessageHeaderType(&doc.V2G_Message.Header);
-    memcpy(doc.V2G_Message.Header.SessionID.bytes, session_id, iso2_sessionIDType_BYTES_SIZE);
-    doc.V2G_Message.Header.SessionID.bytesLen = iso2_sessionIDType_BYTES_SIZE;
-    init_iso2_BodyType(&doc.V2G_Message.Body);
-    doc.V2G_Message.Body.ServiceDiscoveryRes_isUsed = 1;
-    init_iso2_ServiceDiscoveryResType(&doc.V2G_Message.Body.ServiceDiscoveryRes);
-    struct iso2_ServiceDiscoveryResType *res = &doc.V2G_Message.Body.ServiceDiscoveryRes;
-    res->ResponseCode = code;
-
-    init_iso2_PaymentOptionListType(&res->PaymentOptionList);
-    size_t pay_to_copy = payment_count > iso2_paymentOptionType_2_ARRAY_SIZE
-                             ? iso2_paymentOptionType_2_ARRAY_SIZE
-                             : payment_count;
-    res->PaymentOptionList.PaymentOption.arrayLen = (uint16_t)pay_to_copy;
-    for (size_t i = 0; i < pay_to_copy; ++i) {
-        res->PaymentOptionList.PaymentOption.array[i] = payments[i];
-    }
-
-    init_iso2_ChargeServiceType(&res->ChargeService);
-    res->ChargeService.ServiceID = service_id;
-    res->ChargeService.ServiceCategory = iso2_serviceCategoryType_EVCharging;
-    res->ChargeService.FreeService = free_service ? 1 : 0;
-    init_iso2_SupportedEnergyTransferModeType(&res->ChargeService.SupportedEnergyTransferMode);
-    size_t etm_to_copy = etm_count > iso2_EnergyTransferModeType_6_ARRAY_SIZE
-                             ? iso2_EnergyTransferModeType_6_ARRAY_SIZE
-                             : etm_count;
-    res->ChargeService.SupportedEnergyTransferMode.EnergyTransferMode.arrayLen = (uint16_t)etm_to_copy;
-    for (size_t i = 0; i < etm_to_copy; ++i) {
-        res->ChargeService.SupportedEnergyTransferMode.EnergyTransferMode.array[i] = etm[i];
-    }
-    if (service_name) {
-        size_t sn_len = strnlen(service_name, iso2_ServiceName_CHARACTER_SIZE - 1);
-        memcpy(res->ChargeService.ServiceName.characters, service_name, sn_len);
-        res->ChargeService.ServiceName.charactersLen = (uint16_t)sn_len;
-        res->ChargeService.ServiceName_isUsed = 1;
-    }
-    res->ServiceList_isUsed = 0;
-
-    exi_bitstream_t stream;
-    exi_bitstream_init(&stream, out, out_len, 0, NULL);
-    if (encode_iso2_exiDocument(&stream, &doc) != 0) return -EIO;
-    if (written) *written = exi_bitstream_get_length(&stream);
-    return 0;
+    return jpv2g_cbv2g_encode_service_discovery_res_multi(
+        session_id, code, payments, payment_count, etm, etm_count,
+        service_id, service_name, free_service, out, out_len, written);
 }
 
 static void secc_set_dc_evse_status_iso(struct iso2_DC_EVSEStatusType *st) {
@@ -1392,14 +1357,18 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
             return jpv2g_cbv2g_encode_payment_service_selection_res(sid, iso2_responseCodeType_OK, out, out_len, written);
         }
         case JPV2G_PAYMENT_DETAILS_REQ: {
-            bool ok = secc->backend.authorize_contract ? secc->backend.authorize_contract(secc->backend.user_ctx) : true;
+            bool ok = secc->backend.authorize_contract
+                          ? secc->backend.authorize_contract(secc->backend.user_ctx)
+                          : false;
             if (req->protocol == JPV2G_PROTOCOL_DIN70121) {
                 return jpv2g_cbv2g_encode_din_payment_details_res(sid, ok ? din_responseCodeType_OK : din_responseCodeType_FAILED, NULL, (int64_t)time(NULL), out, out_len, written);
             }
             return jpv2g_cbv2g_encode_payment_details_res(sid, ok ? iso2_responseCodeType_OK : iso2_responseCodeType_FAILED, NULL, 0, time(NULL), out, out_len, written);
         }
         case JPV2G_AUTHORIZATION_REQ: {
-            bool ok = secc->backend.authorize_contract ? secc->backend.authorize_contract(secc->backend.user_ctx) : true;
+            bool ok = secc->backend.authorize_contract
+                          ? secc->backend.authorize_contract(secc->backend.user_ctx)
+                          : false;
             if (req->protocol == JPV2G_PROTOCOL_DIN70121) {
                 return jpv2g_cbv2g_encode_din_contract_authentication_res(sid, ok ? din_responseCodeType_OK : din_responseCodeType_FAILED, din_EVSEProcessingType_Finished, out, out_len, written);
             }
@@ -1447,9 +1416,35 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
         }
         case JPV2G_CABLE_CHECK_REQ: {
             if (req->protocol == JPV2G_PROTOCOL_DIN70121) {
-                return jpv2g_cbv2g_encode_din_cable_check_res(sid, din_responseCodeType_OK, din_EVSEProcessingType_Finished, NULL, out, out_len, written);
+                struct din_CableCheckResType res;
+                init_din_CableCheckResType(&res);
+                res.EVSEProcessing = din_EVSEProcessingType_Finished;
+                init_din_DC_EVSEStatusType(&res.DC_EVSEStatus);
+                res.DC_EVSEStatus.NotificationMaxDelay = 0;
+                res.DC_EVSEStatus.EVSENotification = din_EVSENotificationType_StopCharging;
+                res.DC_EVSEStatus.EVSEStatusCode =
+                    din_DC_EVSEStatusCodeType_EVSE_Malfunction;
+                res.DC_EVSEStatus.EVSEIsolationStatus_isUsed = 1;
+                res.DC_EVSEStatus.EVSEIsolationStatus = din_isolationLevelType_Fault;
+                return jpv2g_cbv2g_encode_din_cable_check_res(
+                    sid, din_responseCodeType_FAILED,
+                    din_EVSEProcessingType_Finished, &res,
+                    out, out_len, written);
             }
-            return jpv2g_cbv2g_encode_cable_check_res(sid, iso2_responseCodeType_OK, iso2_EVSEProcessingType_Finished, NULL, out, out_len, written);
+            struct iso2_CableCheckResType res;
+            init_iso2_CableCheckResType(&res);
+            res.EVSEProcessing = iso2_EVSEProcessingType_Finished;
+            init_iso2_DC_EVSEStatusType(&res.DC_EVSEStatus);
+            res.DC_EVSEStatus.NotificationMaxDelay = 0;
+            res.DC_EVSEStatus.EVSENotification = iso2_EVSENotificationType_StopCharging;
+            res.DC_EVSEStatus.EVSEStatusCode =
+                iso2_DC_EVSEStatusCodeType_EVSE_Malfunction;
+            res.DC_EVSEStatus.EVSEIsolationStatus_isUsed = 1;
+            res.DC_EVSEStatus.EVSEIsolationStatus = iso2_isolationLevelType_No_IMD;
+            return jpv2g_cbv2g_encode_cable_check_res(
+                sid, iso2_responseCodeType_FAILED,
+                iso2_EVSEProcessingType_Finished, &res,
+                out, out_len, written);
         }
         case JPV2G_PRE_CHARGE_REQ: {
             if (req->protocol == JPV2G_PROTOCOL_DIN70121) {
@@ -1686,6 +1681,15 @@ static int secc_recv_v2gtp(secc_recv_fn fn, void *ctx, uint8_t *buf, size_t buf_
     if (rc != 0) return rc;
     uint32_t payload_len = jpv2g_read_u32_be(&buf[4]);
     if (payload_len > JPV2G_MAX_PAYLOAD_LENGTH) return -E2BIG;
+    /*
+     * Defense in depth for the fixed on-stack receive buffer: bound the
+     * attacker-controlled length against the ACTUAL buffer BEFORE the size_t
+     * addition below, so `total` can never wrap on a 32-bit target regardless
+     * of what JPV2G_MAX_PAYLOAD_LENGTH is set to. The header-length check at
+     * function entry guarantees buf_len >= JPV2G_V2GTP_HEADER_LEN, so this
+     * subtraction cannot underflow.
+     */
+    if (payload_len > (uint32_t)(buf_len - JPV2G_V2GTP_HEADER_LEN)) return -ENOSPC;
     size_t total = JPV2G_V2GTP_HEADER_LEN + payload_len;
     if (total > buf_len) return -ENOSPC;
     rc = secc_recv_bytes(fn, ctx, buf + JPV2G_V2GTP_HEADER_LEN, payload_len, timeout_ms);
@@ -1695,6 +1699,8 @@ static int secc_recv_v2gtp(secc_recv_fn fn, void *ctx, uint8_t *buf, size_t buf_
 
 int jpv2g_secc_init(jpv2g_secc_t *secc, const jpv2g_secc_config_t *cfg, jpv2g_codec_ctx *codec) {
     if (!secc || !cfg || !codec) return -EINVAL;
+    jpv2g_cbv2g_codec_init();
+    if (!jpv2g_cbv2g_codec_ready()) return -ENOMEM;
     memset(secc, 0, sizeof(*secc));
     secc->cfg = *cfg;
     secc->codec = codec;
@@ -1781,6 +1787,13 @@ static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
                                           int timeout_ms,
                                           secc_stream_obs_t *obs) {
     if (!secc || !recv_fn || !send_fn) return -EINVAL;
+    struct appHand_exiDocument *app_doc =
+        jpv2g_cbv2g_secc_request_app_workspace();
+    struct iso2_exiDocument *iso_doc =
+        jpv2g_cbv2g_secc_request_iso_workspace();
+    struct din_exiDocument *din_doc =
+        jpv2g_cbv2g_secc_request_din_workspace();
+    if (!app_doc || !iso_doc || !din_doc) return -ENOMEM;
     uint8_t buf[JPV2G_MAX_V2GTP_SIZE];
     jpv2g_protocol_t protocol = JPV2G_PROTOCOL_UNKNOWN;
     bool handled_any = false;
@@ -1816,30 +1829,29 @@ static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
         bool decoded_ok = false;
 
         /* Try to decode as AppProtocol */
-        struct appHand_supportedAppProtocolReq app_req;
-        struct appHand_exiDocument app_doc;
-        init_appHand_exiDocument(&app_doc);
+        init_appHand_exiDocument(app_doc);
         exi_bitstream_t app_stream;
         exi_bitstream_init(&app_stream, (uint8_t *)msg.payload, msg.payload_length, 0, NULL);
-        if (decode_appHand_exiDocument(&app_stream, &app_doc) == 0 && app_doc.supportedAppProtocolReq_isUsed) {
+        if (decode_appHand_exiDocument(&app_stream, app_doc) == 0 &&
+            app_doc->supportedAppProtocolReq_isUsed) {
+            const struct appHand_supportedAppProtocolReq *app_req =
+                &app_doc->supportedAppProtocolReq;
             mtype = JPV2G_SUPP_APP_PROTOCOL_REQ;
-            app_req = app_doc.supportedAppProtocolReq;
-            jpv2g_protocol_t detected = detect_protocol_from_app(&app_req);
+            jpv2g_protocol_t detected = detect_protocol_from_app(app_req);
             if (detected != JPV2G_PROTOCOL_UNKNOWN) protocol = detected;
             req_ctx.protocol = protocol;
-            req_ctx.body = &app_req;
+            req_ctx.body = app_req;
             req_log_ctx = req_ctx;
             decoded_ok = true;
         }
 
         /* Try ISO 15118 message if allowed or unknown */
         if (!decoded_ok && protocol != JPV2G_PROTOCOL_DIN70121) {
-            struct iso2_exiDocument iso_doc;
-            init_iso2_exiDocument(&iso_doc);
+            init_iso2_exiDocument(iso_doc);
             exi_bitstream_t iso_stream;
             exi_bitstream_init(&iso_stream, (uint8_t *)msg.payload, msg.payload_length, 0, NULL);
-            if (decode_iso2_exiDocument(&iso_stream, &iso_doc) == 0) {
-                const struct iso2_BodyType *b = &iso_doc.V2G_Message.Body;
+            if (decode_iso2_exiDocument(&iso_stream, iso_doc) == 0) {
+                const struct iso2_BodyType *b = &iso_doc->V2G_Message.Body;
                 const void *decoded = NULL;
                 if (b->SessionSetupReq_isUsed) {
                     mtype = JPV2G_SESSION_SETUP_REQ;
@@ -1896,7 +1908,7 @@ static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
                         protocol = JPV2G_PROTOCOL_ISO15118_2;
                     }
                     req_ctx.protocol = protocol;
-                    req_ctx.header = &iso_doc.V2G_Message.Header;
+                    req_ctx.header = &iso_doc->V2G_Message.Header;
                     req_ctx.din_header = NULL;
                     req_ctx.body = decoded;
                     req_log_ctx = req_ctx;
@@ -1908,12 +1920,11 @@ static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
 
         /* Try DIN 70121 message if not already decoded */
         if (!decoded_ok) {
-            struct din_exiDocument din_doc;
-            init_din_exiDocument(&din_doc);
+            init_din_exiDocument(din_doc);
             exi_bitstream_t din_stream;
             exi_bitstream_init(&din_stream, (uint8_t *)msg.payload, msg.payload_length, 0, NULL);
-            if (decode_din_exiDocument(&din_stream, &din_doc) == 0) {
-                const struct din_BodyType *b = &din_doc.V2G_Message.Body;
+            if (decode_din_exiDocument(&din_stream, din_doc) == 0) {
+                const struct din_BodyType *b = &din_doc->V2G_Message.Body;
                 const void *decoded = NULL;
                 if (b->SessionSetupReq_isUsed) {
                     mtype = JPV2G_SESSION_SETUP_REQ;
@@ -1971,7 +1982,7 @@ static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
                     }
                     req_ctx.protocol = protocol;
                     req_ctx.header = NULL;
-                    req_ctx.din_header = &din_doc.V2G_Message.Header;
+                    req_ctx.din_header = &din_doc->V2G_Message.Header;
                     req_ctx.body = decoded;
                     req_log_ctx = req_ctx;
                     req_log_ctx.body = secc_copy_req_body_for_log(req_ctx.protocol, mtype, req_ctx.body, &req_log_copy);

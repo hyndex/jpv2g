@@ -17,15 +17,16 @@
 #include "cbv2g/din/din_msgDefDatatypes.h"
 #include "cbv2g/iso_2/iso2_msgDefDatatypes.h"
 
-// Pre-allocate the (large) ISO-15118 / DIN / app message documents from PSRAM at
-// boot, off the HLC timing path. OPTIONAL — the codec also allocates them lazily
-// on first use — but calling this in setup keeps the allocation out of the live
-// V2G handshake. Idempotent.
+// Pre-allocate the large ISO-15118 / DIN / app message workspaces from PSRAM at
+// boot, off the HLC timing path. There are three independent document sets:
+// encoder, SECC request decoder, and decoded-response logger. OPTIONAL — the
+// codec also allocates them lazily on first use — but calling this in setup
+// keeps allocation out of the live V2G handshake. Idempotent.
 void jpv2g_cbv2g_codec_init(void);
 
-// True once all three large EXI documents (app / ISO-2 / DIN) are allocated.
-// Lets the HLC bring-up gate on the codec being ready instead of risking a
-// NULL deref on the first V2G message if an allocation ever failed.
+// True once all three independent sets (nine EXI documents total) are
+// allocated. Lets HLC bring-up gate on the codec being ready instead of
+// reaching the first V2G message with an incomplete workspace.
 bool jpv2g_cbv2g_codec_ready(void);
 
 int jpv2g_cbv2g_encode_sapp_req(const char *ns,
@@ -73,6 +74,19 @@ int jpv2g_cbv2g_encode_service_discovery_res(const uint8_t session_id[iso2_sessi
                                                uint8_t *out,
                                                size_t out_len,
                                                size_t *written);
+int jpv2g_cbv2g_encode_service_discovery_res_multi(
+    const uint8_t session_id[iso2_sessionIDType_BYTES_SIZE],
+    iso2_responseCodeType code,
+    const iso2_paymentOptionType *payments,
+    size_t payment_count,
+    const iso2_EnergyTransferModeType *energy_modes,
+    size_t energy_mode_count,
+    uint16_t service_id,
+    const char *service_name,
+    int free_service,
+    uint8_t *out,
+    size_t out_len,
+    size_t *written);
 int jpv2g_cbv2g_decode_service_discovery_res(const uint8_t *buf, size_t len, struct iso2_ServiceDiscoveryResType *res);
 
 int jpv2g_cbv2g_encode_payment_service_selection_req(const uint8_t session_id[iso2_sessionIDType_BYTES_SIZE],

@@ -20,6 +20,7 @@
 #include "cbv2g/din/din_msgDefDatatypes.h"
 #include "cbv2g/iso_2/iso2_msgDefDatatypes.h"
 #include "jpv2g/cbv2g_codec.h"
+#include "cbv2g_workspace.h"
 #endif
 #include "jpv2g/evcc.h"
 #include "jpv2g/handler.h"
@@ -28,6 +29,8 @@
 #include "jpv2g/state_machine.h"
 #include "jpv2g/state_secc.h"
 #include "jpv2g/v2gtp.h"
+#include "jpv2g/byte_utils.h"
+#include "jpv2g/constants.h"
 
 typedef struct {
     size_t calls;
@@ -63,6 +66,59 @@ static int test_v2gtp_round_trip(void) {
     if (assert_true(parsed.payload_type == JPV2G_PAYLOAD_EXI, "payload type must match") != 0) return 1;
     if (assert_true(parsed.payload_length == sizeof(payload), "payload length must match") != 0) return 1;
     if (assert_true(memcmp(parsed.payload, payload, sizeof(payload)) == 0, "payload bytes must round trip") != 0) return 1;
+    return 0;
+}
+
+/*
+ * Regression for the V2GTP payload-length bound (byte_utils.h
+ * JPV2G_MAX_PAYLOAD_LENGTH). A V2GTP frame's 32-bit length field is
+ * attacker-controlled on the CCS PLC link. Before the fix the macro was
+ * UINT32_MAX, so the `payload_length > JPV2G_MAX_PAYLOAD_LENGTH` guard could
+ * never fire and a length near the top of the uint32 range wrapped
+ * `header + length` on 32-bit size_t, reading gigabytes into a ~4 KB on-stack
+ * buffer in secc_recv_v2gtp(). secc_recv_v2gtp() is static; jpv2g_v2gtp_parse()
+ * shares the exact same guard and constants, so it is the public witness for
+ * the invariant. NOTE: on this 64-bit host the size_t addition does not wrap,
+ * so this proves the LENGTH-BOUND guard now fires (returns -E2BIG) for any
+ * oversized frame; the on-target stack-smash reproduction is 32-bit-specific
+ * and belongs to HIL. The distinguishing signal is -E2BIG (guard fired) vs the
+ * pre-fix -EMSGSIZE/-ENOSPC (fell through to the buffer-size check).
+ */
+static int test_v2gtp_length_bounds(void) {
+    /* A valid maximum-size payload still round-trips. */
+    static uint8_t big_payload[JPV2G_MAX_EXI_SIZE];
+    for (size_t i = 0; i < sizeof(big_payload); ++i) big_payload[i] = (uint8_t)i;
+    uint8_t frame[JPV2G_MAX_V2GTP_SIZE];
+    size_t frame_len = 0;
+    int rc = jpv2g_v2gtp_build(JPV2G_PAYLOAD_EXI, big_payload, sizeof(big_payload),
+                               frame, sizeof(frame), &frame_len);
+    if (assert_true(rc == 0, "max-size V2GTP payload must build") != 0) return 1;
+    jpv2g_v2gtp_t parsed;
+    rc = jpv2g_v2gtp_parse(frame, frame_len, &parsed);
+    if (assert_true(rc == 0, "max-size V2GTP payload must parse") != 0) return 1;
+
+    /* Hand-craft a header claiming one byte more than the EXI ceiling. Provide
+     * a buffer large enough that the ONLY thing that can reject it is the length
+     * guard — before the fix this fell through to validate() and was accepted
+     * as a well-formed (oversized) frame. */
+    uint8_t over[JPV2G_V2GTP_HEADER_LEN + 8] = {0};
+    over[0] = 0x01;           /* protocol version */
+    over[1] = (uint8_t)0xFE;  /* inverse version  */
+    jpv2g_write_u16_be(&over[2], (uint16_t)JPV2G_PAYLOAD_EXI);
+    jpv2g_write_u32_be(&over[4], (uint32_t)(JPV2G_MAX_EXI_SIZE + 1));
+    jpv2g_v2gtp_t out;
+    rc = jpv2g_v2gtp_parse(over, sizeof(over), &out);
+    if (assert_true(rc == -E2BIG, "payload_length above the EXI ceiling must be rejected -E2BIG") != 0) return 1;
+
+    /* The wrap trigger: a length field in 0xFFFFFFF8..0xFFFFFFFF must be
+     * rejected by the length guard, never allowed to wrap the header+length
+     * total. Assert the guard result, not merely "some error". */
+    jpv2g_write_u32_be(&over[4], 0xFFFFFFFFu);
+    rc = jpv2g_v2gtp_parse(over, sizeof(over), &out);
+    if (assert_true(rc == -E2BIG, "max-uint32 payload_length must hit the length guard, not wrap") != 0) return 1;
+    jpv2g_write_u32_be(&over[4], 0xFFFFFFF8u);
+    rc = jpv2g_v2gtp_parse(over, sizeof(over), &out);
+    if (assert_true(rc == -E2BIG, "near-wrap payload_length must hit the length guard") != 0) return 1;
     return 0;
 }
 
@@ -672,6 +728,18 @@ static int test_supported_app_protocol_interop(void) {
                         !response_doc.SchemaID_isUsed,
                     "major-version mismatch alone must fail without SchemaID") != 0) return 1;
 
+    set_app_offer_version(&mixed.AppProtocol.array[0],
+                          "urn:iso:std:iso:15118:-20:CommonMessages",
+                          1,
+                          0,
+                          60,
+                          1);
+    if (assert_true(negotiate_app_protocol(&secc, &mixed, &response_doc) == 0 &&
+                        response_doc.ResponseCode ==
+                            appHand_responseCodeType_Failed_NoNegotiation &&
+                        !response_doc.SchemaID_isUsed,
+                    "ISO 15118-20-only offer must fail explicitly while unsupported") != 0) return 1;
+
     set_app_offer(&mixed.AppProtocol.array[0],
                   "urn:iso:15118:2:2010:MsgDef",
                   10,
@@ -692,6 +760,91 @@ static int test_supported_app_protocol_interop(void) {
                             appHand_responseCodeType_Failed_NoNegotiation &&
                         !response_doc.SchemaID_isUsed,
                     "Failed_NoNegotiation must omit optional SchemaID") != 0) return 1;
+    return 0;
+}
+
+static bool test_authorize_allow(void *user_ctx) {
+    (void)user_ctx;
+    return true;
+}
+
+static int test_default_secc_safety_is_fail_closed(void) {
+    static const uint8_t session_id[iso2_sessionIDType_BYTES_SIZE] =
+        {0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x17, 0x28};
+    uint8_t response[JPV2G_MAX_EXI_SIZE];
+    size_t response_len = 0;
+    jpv2g_secc_t secc;
+    jpv2g_secc_request_t request;
+    struct iso2_MessageHeaderType header;
+    struct iso2_AuthorizationReqType authorization;
+    struct iso2_AuthorizationResType authorization_res;
+    struct iso2_CableCheckReqType cable_check;
+    struct iso2_CableCheckResType cable_check_res;
+
+    memset(&secc, 0, sizeof(secc));
+    memset(&request, 0, sizeof(request));
+    jpv2g_secc_config_default(&secc.cfg);
+    jpv2g_backend_set_defaults(&secc.backend);
+    if (assert_true(!secc.backend.authorize_contract(secc.backend.user_ctx) &&
+                        !secc.backend.authorize_external(secc.backend.user_ctx),
+                    "default backend authorization must deny both payment modes") != 0) return 1;
+
+    memcpy(secc.session_id, session_id, sizeof(session_id));
+    init_iso2_MessageHeaderType(&header);
+    memcpy(header.SessionID.bytes, session_id, sizeof(session_id));
+    header.SessionID.bytesLen = sizeof(session_id);
+    request.protocol = JPV2G_PROTOCOL_ISO15118_2;
+    request.header = &header;
+
+    init_iso2_AuthorizationReqType(&authorization);
+    request.body = &authorization;
+    if (assert_true(jpv2g_secc_default_handle(&secc,
+                                              JPV2G_AUTHORIZATION_REQ,
+                                              &request,
+                                              response,
+                                              sizeof(response),
+                                              &response_len) == 0 &&
+                        jpv2g_cbv2g_decode_authorization_res(
+                            response, response_len, &authorization_res) == 0,
+                    "default authorization denial must encode") != 0) return 1;
+    if (assert_true(authorization_res.ResponseCode == iso2_responseCodeType_FAILED &&
+                        authorization_res.EVSEProcessing == iso2_EVSEProcessingType_Finished,
+                    "missing application authorization must be a terminal denial") != 0) return 1;
+
+    init_iso2_CableCheckReqType(&cable_check);
+    request.body = &cable_check;
+    response_len = 0;
+    if (assert_true(jpv2g_secc_default_handle(&secc,
+                                              JPV2G_CABLE_CHECK_REQ,
+                                              &request,
+                                              response,
+                                              sizeof(response),
+                                              &response_len) == 0 &&
+                        jpv2g_cbv2g_decode_cable_check_res(
+                            response, response_len, &cable_check_res) == 0,
+                    "default CableCheck failure must encode") != 0) return 1;
+    if (assert_true(cable_check_res.ResponseCode == iso2_responseCodeType_FAILED &&
+                        cable_check_res.EVSEProcessing == iso2_EVSEProcessingType_Finished &&
+                        cable_check_res.DC_EVSEStatus.EVSEStatusCode ==
+                            iso2_DC_EVSEStatusCodeType_EVSE_Malfunction &&
+                        cable_check_res.DC_EVSEStatus.EVSEIsolationStatus_isUsed &&
+                        cable_check_res.DC_EVSEStatus.EVSEIsolationStatus ==
+                            iso2_isolationLevelType_No_IMD,
+                    "default CableCheck must never fabricate Ready/Valid isolation") != 0) return 1;
+
+    secc.backend.authorize_contract = test_authorize_allow;
+    request.body = &authorization;
+    response_len = 0;
+    if (assert_true(jpv2g_secc_default_handle(&secc,
+                                              JPV2G_AUTHORIZATION_REQ,
+                                              &request,
+                                              response,
+                                              sizeof(response),
+                                              &response_len) == 0 &&
+                        jpv2g_cbv2g_decode_authorization_res(
+                            response, response_len, &authorization_res) == 0 &&
+                        authorization_res.ResponseCode == iso2_responseCodeType_OK,
+                    "an explicit application authorization callback must still allow") != 0) return 1;
     return 0;
 }
 
@@ -1026,6 +1179,122 @@ static int test_iso_energy_mode_membership(void) {
                         cpd_res.ResponseCode ==
                             iso2_responseCodeType_FAILED_WrongEnergyTransferMode,
                     "ISO CPD must reject an unadvertised transfer mode") != 0) return 1;
+    return 0;
+}
+
+static int test_cbv2g_workspace_identity_and_service_discovery_multi(void) {
+    static const uint8_t session_id[iso2_sessionIDType_BYTES_SIZE] =
+        {0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87};
+    jpv2g_cbv2g_codec_init();
+    void *workspaces[] = {
+        jpv2g_cbv2g_encode_app_workspace(),
+        jpv2g_cbv2g_encode_iso_workspace(),
+        jpv2g_cbv2g_encode_din_workspace(),
+        jpv2g_cbv2g_secc_request_app_workspace(),
+        jpv2g_cbv2g_secc_request_iso_workspace(),
+        jpv2g_cbv2g_secc_request_din_workspace(),
+        jpv2g_cbv2g_secc_log_app_workspace(),
+        jpv2g_cbv2g_secc_log_iso_workspace(),
+        jpv2g_cbv2g_secc_log_din_workspace(),
+    };
+    const size_t workspace_count = sizeof(workspaces) / sizeof(workspaces[0]);
+
+    if (assert_true(jpv2g_cbv2g_codec_ready(),
+                    "all cbv2g workspaces must be ready after init") != 0) return 1;
+    for (size_t i = 0; i < workspace_count; ++i) {
+        if (assert_true(workspaces[i] != NULL,
+                        "every cbv2g workspace must be allocated") != 0) return 1;
+        for (size_t j = i + 1; j < workspace_count; ++j) {
+            if (assert_true(workspaces[i] != workspaces[j],
+                            "encoder/request/log EXI workspaces must not alias") != 0) return 1;
+        }
+    }
+
+    jpv2g_cbv2g_codec_init();
+    void *workspaces_after_second_init[] = {
+        jpv2g_cbv2g_encode_app_workspace(),
+        jpv2g_cbv2g_encode_iso_workspace(),
+        jpv2g_cbv2g_encode_din_workspace(),
+        jpv2g_cbv2g_secc_request_app_workspace(),
+        jpv2g_cbv2g_secc_request_iso_workspace(),
+        jpv2g_cbv2g_secc_request_din_workspace(),
+        jpv2g_cbv2g_secc_log_app_workspace(),
+        jpv2g_cbv2g_secc_log_iso_workspace(),
+        jpv2g_cbv2g_secc_log_din_workspace(),
+    };
+    for (size_t i = 0; i < workspace_count; ++i) {
+        if (assert_true(workspaces[i] == workspaces_after_second_init[i],
+                        "cbv2g workspace init must be idempotent") != 0) return 1;
+    }
+
+    uint8_t single[JPV2G_MAX_EXI_SIZE];
+    uint8_t multi[JPV2G_MAX_EXI_SIZE];
+    size_t single_len = 0;
+    size_t multi_len = 0;
+    const iso2_paymentOptionType payment = iso2_paymentOptionType_ExternalPayment;
+    const iso2_EnergyTransferModeType mode = iso2_EnergyTransferModeType_DC_core;
+    if (assert_true(jpv2g_cbv2g_encode_service_discovery_res(
+                        session_id, iso2_responseCodeType_OK, payment, mode,
+                        1, "DC charging", 0,
+                        single, sizeof(single), &single_len) == 0,
+                    "single-mode ServiceDiscovery response must encode") != 0) return 1;
+    if (assert_true(jpv2g_cbv2g_encode_service_discovery_res_multi(
+                        session_id, iso2_responseCodeType_OK,
+                        &payment, 1, &mode, 1,
+                        1, "DC charging", 0,
+                        multi, sizeof(multi), &multi_len) == 0,
+                    "one-entry multi-mode ServiceDiscovery response must encode") != 0) return 1;
+    if (assert_true(single_len == multi_len &&
+                        memcmp(single, multi, single_len) == 0,
+                    "single-mode wrapper and one-entry multi encoder must be byte-equivalent") != 0) return 1;
+
+    const iso2_paymentOptionType payments[] = {
+        iso2_paymentOptionType_ExternalPayment,
+        iso2_paymentOptionType_Contract,
+        iso2_paymentOptionType_ExternalPayment,
+    };
+    const iso2_EnergyTransferModeType modes[] = {
+        iso2_EnergyTransferModeType_DC_core,
+        iso2_EnergyTransferModeType_DC_extended,
+        iso2_EnergyTransferModeType_DC_combo_core,
+        iso2_EnergyTransferModeType_DC_unique,
+        iso2_EnergyTransferModeType_DC_core,
+        iso2_EnergyTransferModeType_DC_extended,
+        iso2_EnergyTransferModeType_DC_combo_core,
+    };
+    struct iso2_ServiceDiscoveryResType decoded;
+    if (assert_true(jpv2g_cbv2g_encode_service_discovery_res_multi(
+                        session_id, iso2_responseCodeType_OK,
+                        payments, sizeof(payments) / sizeof(payments[0]),
+                        modes, sizeof(modes) / sizeof(modes[0]),
+                        7, "multi", 1,
+                        multi, sizeof(multi), &multi_len) == 0 &&
+                        jpv2g_cbv2g_decode_service_discovery_res(
+                            multi, multi_len, &decoded) == 0,
+                    "multi-entry ServiceDiscovery response must round trip") != 0) return 1;
+    if (assert_true(decoded.PaymentOptionList.PaymentOption.arrayLen ==
+                            iso2_paymentOptionType_2_ARRAY_SIZE &&
+                        decoded.ChargeService.SupportedEnergyTransferMode
+                                .EnergyTransferMode.arrayLen ==
+                            iso2_EnergyTransferModeType_6_ARRAY_SIZE,
+                    "multi encoder must clamp arrays to schema capacity") != 0) return 1;
+    if (assert_true(decoded.PaymentOptionList.PaymentOption.array[0] == payments[0] &&
+                        decoded.PaymentOptionList.PaymentOption.array[1] == payments[1] &&
+                        decoded.ChargeService.SupportedEnergyTransferMode
+                                .EnergyTransferMode.array[0] == modes[0] &&
+                        decoded.ChargeService.SupportedEnergyTransferMode
+                                .EnergyTransferMode.array[5] == modes[5],
+                    "multi encoder must preserve ordered members through the schema limit") != 0) return 1;
+
+    if (assert_true(jpv2g_cbv2g_encode_service_discovery_res_multi(
+                        session_id, iso2_responseCodeType_OK,
+                        NULL, 0, &mode, 1, 1, NULL, 0,
+                        multi, sizeof(multi), &multi_len) == -EINVAL &&
+                        jpv2g_cbv2g_encode_service_discovery_res_multi(
+                            session_id, iso2_responseCodeType_OK,
+                            &payment, 1, NULL, 0, 1, NULL, 0,
+                            multi, sizeof(multi), &multi_len) == -EINVAL,
+                    "multi encoder must reject missing payment or energy-mode membership") != 0) return 1;
     return 0;
 }
 
@@ -1611,13 +1880,16 @@ static int test_secc_stream_enforces_sequence(void) {
 
 int main(void) {
     if (test_v2gtp_round_trip() != 0) return 1;
+    if (test_v2gtp_length_bounds() != 0) return 1;
     if (test_evcc_state_sequence() != 0) return 1;
     if (test_secc_state_sequence() != 0) return 1;
     if (test_secc_production_sequence() != 0) return 1;
 #ifdef JPV2G_ENABLE_CBV2G_CODEC
     if (test_supported_app_protocol_interop() != 0) return 1;
+    if (test_default_secc_safety_is_fail_closed() != 0) return 1;
     if (test_din_dc_interop_responses() != 0) return 1;
     if (test_iso_energy_mode_membership() != 0) return 1;
+    if (test_cbv2g_workspace_identity_and_service_discovery_multi() != 0) return 1;
     if (test_iso_dc_transition_response_round_trip() != 0) return 1;
     if (test_din_dc_transition_response_round_trip() != 0) return 1;
     if (test_iso_pause_resume() != 0) return 1;

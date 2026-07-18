@@ -55,15 +55,22 @@ foreign SessionID before invoking application handlers.
 
 - API: `jpv2g_set_random_provider(jpv2g_random_provider_fn fn)`
 - Default behavior:
+  - a registered provider (via `jpv2g_set_random_provider`) if one is set
   - `ESP_PLATFORM`: uses `esp_fill_random`
-  - Linux/macOS: native OS randomness
-  - fallback: `rand()`
+  - all other platforms (incl. Linux/macOS host): plain libc `rand()` —
+    **there is no native-OS-randomness path**. For cryptographic-quality
+    entropy on host builds (e.g. SessionID / GenChallenge), register your own
+    source via `jpv2g_set_random_provider()`.
 
 ### Time source
 
 - API: `jpv2g_now_monotonic_ms()`, `jpv2g_sleep_ms()`
 - `ESP_PLATFORM`: uses `esp_timer_get_time()` and `vTaskDelay()`
-- non-ESP: uses `clock_gettime(CLOCK_MONOTONIC)` and `usleep()`
+- non-ESP: `jpv2g_now_monotonic_ms()` uses `timespec_get(TIME_UTC)` (host
+  **wall-clock — NOT monotonic**; it can step under NTP correction), and
+  `jpv2g_sleep_ms()` **busy-waits on `clock()`** (process CPU time) rather than
+  yielding via `usleep()`. Install a provider/port these hooks for a real host
+  deployment.
 
 These hooks avoid direct dependency on Linux-only timing behavior in EVCC/SECC/TLS paths.
 
@@ -77,24 +84,24 @@ These hooks avoid direct dependency on Linux-only timing behavior in EVCC/SECC/T
 ## Build and Test (Host)
 
 ```bash
-cmake -S /home/jpi/Desktop/EVSE/jpv2g -B /home/jpi/Desktop/EVSE/jpv2g/build
-cmake --build /home/jpi/Desktop/EVSE/jpv2g/build -j
+cmake -S <jpv2g> -B <jpv2g>/build
+cmake --build <jpv2g>/build -j
 ```
 
 Enable tests:
 
 ```bash
-cmake -S /home/jpi/Desktop/EVSE/jpv2g -B /home/jpi/Desktop/EVSE/jpv2g/build-test -DJPV2G_BUILD_TESTING=ON
-cmake --build /home/jpi/Desktop/EVSE/jpv2g/build-test -j
-ctest --test-dir /home/jpi/Desktop/EVSE/jpv2g/build-test --output-on-failure
+cmake -S <jpv2g> -B <jpv2g>/build-test -DJPV2G_BUILD_TESTING=ON
+cmake --build <jpv2g>/build-test -j
+ctest --test-dir <jpv2g>/build-test --output-on-failure
 ```
 
 ## Build and Test (ESP32 Arduino via PlatformIO)
 
 ```bash
-pio run -d /home/jpi/Desktop/EVSE/jpv2g/platformio/esp32_arduino_smoke
-pio run -d /home/jpi/Desktop/EVSE/jpv2g/platformio/esp32_arduino_smoke -t upload
-pio device monitor -d /home/jpi/Desktop/EVSE/jpv2g/platformio/esp32_arduino_smoke -b 115200
+pio run -d <jpv2g>/platformio/esp32_arduino_smoke
+pio run -d <jpv2g>/platformio/esp32_arduino_smoke -t upload
+pio device monitor -d <jpv2g>/platformio/esp32_arduino_smoke -b 115200
 ```
 
 Expected serial output should report `PASS` for all smoke checks.
@@ -104,9 +111,9 @@ Expected serial output should report `PASS` for all smoke checks.
 Use:
 
 ```bash
-pio run -d /home/jpi/Desktop/EVSE/jpv2g/platformio/esp32s3_slac_hlc_precharge
-pio run -d /home/jpi/Desktop/EVSE/jpv2g/platformio/esp32s3_slac_hlc_precharge -t upload --upload-port /dev/ttyACM0
-pio device monitor -d /home/jpi/Desktop/EVSE/jpv2g/platformio/esp32s3_slac_hlc_precharge -b 115200
+pio run -d <jpv2g>/platformio/esp32s3_slac_hlc_precharge
+pio run -d <jpv2g>/platformio/esp32s3_slac_hlc_precharge -t upload --upload-port /dev/ttyACM0
+pio device monitor -d <jpv2g>/platformio/esp32s3_slac_hlc_precharge -b 115200
 ```
 
 Flow:
