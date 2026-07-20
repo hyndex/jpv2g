@@ -1802,11 +1802,22 @@ static int test_secc_session_id_validation(void) {
                                                         JPV2G_SESSION_SETUP_REQ,
                                                         &req) == 0,
                     "new SessionSetup may omit SessionID") != 0) return 1;
+    /* Gap audit #2 (2026-07-20): short SessionIDs are FIELD REALITY, not
+     * malformed input — RISE-V2G's own EVCC sends a 1-byte 0x00 SID at
+     * SessionSetup, and EvseV2G zero-pads short SIDs. Any length <= 8 must be
+     * accepted at SessionSetup (resolve treats non-8 as "no SID" -> fresh
+     * session); the old -EINVAL hard-dropped every RISE-derived EV stack. */
     header.SessionID.bytesLen = 3;
     if (assert_true(jpv2g_secc_validate_request_session(&secc,
                                                         JPV2G_SESSION_SETUP_REQ,
-                                                        &req) == -EINVAL,
-                    "malformed SessionSetup SessionID length must be rejected") != 0) return 1;
+                                                        &req) == 0,
+                    "short SessionSetup SessionID must be tolerated (gap #2)") != 0) return 1;
+    header.SessionID.bytesLen = 1;
+    header.SessionID.bytes[0] = 0x00;
+    if (assert_true(jpv2g_secc_validate_request_session(&secc,
+                                                        JPV2G_SESSION_SETUP_REQ,
+                                                        &req) == 0,
+                    "1-byte zero SessionID (RISE-V2G EVCC) must be tolerated") != 0) return 1;
 
     for (size_t i = 0; i < sizeof(secc.session_id); ++i) secc.session_id[i] = (uint8_t)(i + 1);
     header.SessionID.bytesLen = sizeof(header.SessionID.bytes);
@@ -1825,6 +1836,311 @@ static int test_secc_session_id_validation(void) {
                                                         JPV2G_SERVICE_DISCOVERY_REQ,
                                                         &req) == -EACCES,
                     "post-setup requests must not omit SessionID") != 0) return 1;
+    return 0;
+}
+
+/* Gap audit #3 (2026-07-20): the minimal per-message FAILED responses must be
+ * schema-valid — an EV EXI decoder that cannot decode the Res is no better
+ * than the silent RST this feature replaces. Round-trip a representative
+ * sample through the real decoders. */
+static int test_secc_min_failed_res_is_decodable(void) {
+    uint8_t sid[iso2_sessionIDType_BYTES_SIZE];
+    uint8_t exi[JPV2G_MAX_EXI_SIZE];
+    size_t exi_len = 0;
+    for (size_t i = 0; i < sizeof(sid); ++i) sid[i] = (uint8_t)(0xA0 + i);
+
+    /* ISO2 CurrentDemandRes / FAILED_SequenceError */
+    if (assert_true(jpv2g_cbv2g_encode_min_failed_res(
+                        JPV2G_PROTOCOL_ISO15118_2, JPV2G_CURRENT_DEMAND_REQ,
+                        JPV2G_MIN_FAILED_SEQUENCE_ERROR, sid, "IN*JPE*E1", NULL, 0,
+                        exi, sizeof(exi), &exi_len) == 0 && exi_len > 0,
+                    "min-failed ISO2 CurrentDemandRes encodes") != 0) return 1;
+    {
+        struct iso2_CurrentDemandResType res;
+        if (assert_true(jpv2g_cbv2g_decode_current_demand_res(exi, exi_len, &res) == 0,
+                        "min-failed ISO2 CurrentDemandRes decodes") != 0) return 1;
+        if (assert_true(res.ResponseCode == iso2_responseCodeType_FAILED_SequenceError,
+                        "min-failed ISO2 CurrentDemandRes carries FAILED_SequenceError") != 0) return 1;
+    }
+
+    /* ISO2 SessionSetupRes / FAILED_UnknownSession */
+    if (assert_true(jpv2g_cbv2g_encode_min_failed_res(
+                        JPV2G_PROTOCOL_ISO15118_2, JPV2G_SESSION_SETUP_REQ,
+                        JPV2G_MIN_FAILED_UNKNOWN_SESSION, sid, "IN*JPE*E1", NULL, 0,
+                        exi, sizeof(exi), &exi_len) == 0 && exi_len > 0,
+                    "min-failed ISO2 SessionSetupRes encodes") != 0) return 1;
+    {
+        struct iso2_SessionSetupResType res;
+        uint8_t sid_out[iso2_sessionIDType_BYTES_SIZE];
+        if (assert_true(jpv2g_cbv2g_decode_session_setup_res(exi, exi_len, &res, sid_out) == 0,
+                        "min-failed ISO2 SessionSetupRes decodes") != 0) return 1;
+        if (assert_true(res.ResponseCode == iso2_responseCodeType_FAILED_UnknownSession,
+                        "min-failed ISO2 SessionSetupRes carries FAILED_UnknownSession") != 0) return 1;
+    }
+
+    /* DIN CableCheckRes / FAILED_SequenceError (decode via the raw document) */
+    static const uint8_t din_evse_id[] = {'J','P','1'};
+    if (assert_true(jpv2g_cbv2g_encode_min_failed_res(
+                        JPV2G_PROTOCOL_DIN70121, JPV2G_CABLE_CHECK_REQ,
+                        JPV2G_MIN_FAILED_SEQUENCE_ERROR, sid, NULL,
+                        din_evse_id, sizeof(din_evse_id),
+                        exi, sizeof(exi), &exi_len) == 0 && exi_len > 0,
+                    "min-failed DIN CableCheckRes encodes") != 0) return 1;
+    {
+        struct din_exiDocument doc;
+        exi_bitstream_t stream;
+        exi_bitstream_init(&stream, exi, exi_len, 0, NULL);
+        if (assert_true(decode_din_exiDocument(&stream, &doc) == 0 &&
+                            doc.V2G_Message.Body.CableCheckRes_isUsed,
+                        "min-failed DIN CableCheckRes decodes") != 0) return 1;
+        if (assert_true(doc.V2G_Message.Body.CableCheckRes.ResponseCode ==
+                            din_responseCodeType_FAILED_SequenceError,
+                        "min-failed DIN CableCheckRes carries FAILED_SequenceError") != 0) return 1;
+    }
+
+    /* DIN SessionStopRes / FAILED_UnknownSession */
+    if (assert_true(jpv2g_cbv2g_encode_min_failed_res(
+                        JPV2G_PROTOCOL_DIN70121, JPV2G_SESSION_STOP_REQ,
+                        JPV2G_MIN_FAILED_UNKNOWN_SESSION, sid, NULL,
+                        din_evse_id, sizeof(din_evse_id),
+                        exi, sizeof(exi), &exi_len) == 0 && exi_len > 0,
+                    "min-failed DIN SessionStopRes encodes") != 0) return 1;
+    {
+        struct din_exiDocument doc;
+        exi_bitstream_t stream;
+        exi_bitstream_init(&stream, exi, exi_len, 0, NULL);
+        if (assert_true(decode_din_exiDocument(&stream, &doc) == 0 &&
+                            doc.V2G_Message.Body.SessionStopRes_isUsed,
+                        "min-failed DIN SessionStopRes decodes") != 0) return 1;
+        if (assert_true(doc.V2G_Message.Body.SessionStopRes.ResponseCode ==
+                            din_responseCodeType_FAILED_UnknownSession,
+                        "min-failed DIN SessionStopRes carries FAILED_UnknownSession") != 0) return 1;
+    }
+    return 0;
+}
+
+/* Gap audit #3 wire proof: a sequence-violating request must produce a
+ * decodable FAILED Res ON THE SOCKET before the stream tears down. */
+static int test_secc_stream_sends_failed_res_before_teardown(void) {
+    jpv2g_codec_ctx *codec = NULL;
+    jpv2g_secc_config_t cfg;
+    jpv2g_secc_t secc;
+    int sockets[2] = {-1, -1};
+    uint8_t exi[JPV2G_MAX_EXI_SIZE];
+    uint8_t frame[JPV2G_MAX_V2GTP_SIZE];
+    size_t exi_len = 0;
+    size_t frame_len = 0;
+    const uint8_t evcc_id[iso2_evccIDType_BYTES_SIZE] = {1, 2, 3, 4, 5, 6};
+
+    jpv2g_secc_config_default(&cfg);
+    if (assert_true(jpv2g_codec_init(&codec) == 0, "codec init for failed-res test") != 0) return 1;
+    if (assert_true(jpv2g_secc_init(&secc, &cfg, codec) == 0, "SECC init for failed-res test") != 0) {
+        jpv2g_codec_free(codec);
+        return 1;
+    }
+    if (assert_true(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0,
+                    "socketpair for failed-res test") != 0) {
+        jpv2g_codec_free(codec);
+        return 1;
+    }
+    /* SessionSetup before app-protocol negotiation = sequence violation. */
+    if (assert_true(jpv2g_cbv2g_encode_session_setup_req(
+                        evcc_id, exi, sizeof(exi), &exi_len) == 0,
+                    "encode out-of-order SessionSetup (failed-res)") != 0) return 1;
+    if (assert_true(jpv2g_v2gtp_build(JPV2G_PAYLOAD_EXI, exi, exi_len,
+                                      frame, sizeof(frame), &frame_len) == 0,
+                    "wrap out-of-order SessionSetup (failed-res)") != 0) return 1;
+    if (assert_true(send(sockets[1], frame, frame_len, 0) == (ssize_t)frame_len,
+                    "write failed-res trigger frame") != 0) return 1;
+    shutdown(sockets[1], SHUT_WR);
+
+    const int rc = jpv2g_secc_handle_client(&secc, sockets[0], 100);
+    if (assert_true(rc == -EPROTO,
+                    "sequence violation still terminates with -EPROTO") != 0) return 1;
+
+    /* The FAILED Res must be on the wire: V2GTP header + EXI SessionSetupRes
+     * with FAILED_SequenceError. */
+    uint8_t rx[JPV2G_MAX_V2GTP_SIZE];
+    ssize_t got = recv(sockets[1], rx, sizeof(rx), 0);
+    if (assert_true(got > (ssize_t)JPV2G_V2GTP_HEADER_LEN,
+                    "FAILED Res bytes present on the socket") != 0) return 1;
+    jpv2g_v2gtp_t msg;
+    if (assert_true(jpv2g_v2gtp_parse(rx, (size_t)got, &msg) == 0 &&
+                        msg.payload_type == JPV2G_PAYLOAD_EXI,
+                    "FAILED Res is a valid V2GTP EXI frame") != 0) return 1;
+    struct iso2_SessionSetupResType res;
+    uint8_t sid_out[iso2_sessionIDType_BYTES_SIZE];
+    if (assert_true(jpv2g_cbv2g_decode_session_setup_res(
+                        msg.payload, msg.payload_length, &res, sid_out) == 0,
+                    "FAILED Res decodes as SessionSetupRes") != 0) return 1;
+    if (assert_true(res.ResponseCode == iso2_responseCodeType_FAILED_SequenceError,
+                    "FAILED Res carries FAILED_SequenceError") != 0) return 1;
+
+    close(sockets[0]);
+    close(sockets[1]);
+    jpv2g_codec_free(codec);
+    return 0;
+}
+
+/* Gap audit #9: one undecodable frame mid-stream must NOT tear down the
+ * session (bounded ignore); pre-session garbage still must. */
+static int test_secc_stream_ignores_undecodable_midsession(void) {
+    jpv2g_codec_ctx *codec = NULL;
+    jpv2g_secc_config_t cfg;
+    jpv2g_secc_t secc;
+    int sockets[2] = {-1, -1};
+    uint8_t exi[JPV2G_MAX_EXI_SIZE];
+    uint8_t frame[JPV2G_MAX_V2GTP_SIZE];
+    size_t exi_len = 0;
+    size_t frame_len = 0;
+
+    jpv2g_secc_config_default(&cfg);
+    if (assert_true(jpv2g_codec_init(&codec) == 0, "codec init for ignore test") != 0) return 1;
+    if (assert_true(jpv2g_secc_init(&secc, &cfg, codec) == 0, "SECC init for ignore test") != 0) {
+        jpv2g_codec_free(codec);
+        return 1;
+    }
+    if (assert_true(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0,
+                    "socketpair for ignore test") != 0) {
+        jpv2g_codec_free(codec);
+        return 1;
+    }
+
+    /* 1: valid SupportedAppProtocolReq (DIN offer) — establishes handled_any. */
+    if (assert_true(jpv2g_cbv2g_encode_sapp_req(
+                        "urn:din:70121:2012:MsgDef", 2, 0, 1, 1,
+                        exi, sizeof(exi), &exi_len) == 0,
+                    "encode SAPP for ignore test") != 0) return 1;
+    if (assert_true(jpv2g_v2gtp_build(JPV2G_PAYLOAD_EXI, exi, exi_len,
+                                      frame, sizeof(frame), &frame_len) == 0,
+                    "wrap SAPP for ignore test") != 0) return 1;
+    if (assert_true(send(sockets[1], frame, frame_len, 0) == (ssize_t)frame_len,
+                    "send SAPP for ignore test") != 0) return 1;
+
+    /* 2: garbage EXI payload — must be IGNORED, not fatal. */
+    {
+        uint8_t junk[24];
+        for (size_t i = 0; i < sizeof(junk); ++i) junk[i] = (uint8_t)(0x5A ^ i);
+        if (assert_true(jpv2g_v2gtp_build(JPV2G_PAYLOAD_EXI, junk, sizeof(junk),
+                                          frame, sizeof(frame), &frame_len) == 0,
+                        "wrap garbage frame") != 0) return 1;
+        if (assert_true(send(sockets[1], frame, frame_len, 0) == (ssize_t)frame_len,
+                        "send garbage frame") != 0) return 1;
+    }
+    shutdown(sockets[1], SHUT_WR);
+
+    /* After the garbage frame is ignored the writer side is already shut
+     * down, so the next recv sees EOF -> -ECONNRESET (peer closed). The
+     * defect this guards against is -EBADMSG: the OLD code tore the stream
+     * down ON the garbage frame itself, before ever reaching EOF. */
+    const int rc = jpv2g_secc_handle_client(&secc, sockets[0], 100);
+    if (assert_true(rc == -ECONNRESET,
+                    "stream survives one undecodable mid-session frame (exits on peer EOF, not -EBADMSG)") != 0) return 1;
+
+    /* The SAPP response must still have been produced. */
+    uint8_t rx[JPV2G_MAX_V2GTP_SIZE];
+    ssize_t got = recv(sockets[1], rx, sizeof(rx), 0);
+    if (assert_true(got > (ssize_t)JPV2G_V2GTP_HEADER_LEN,
+                    "SAPP res present despite garbage frame") != 0) return 1;
+
+    close(sockets[0]);
+    close(sockets[1]);
+    jpv2g_codec_free(codec);
+    return 0;
+}
+
+/* Gap audit #10: negative timestamp must OMIT the optional DIN DateTimeNow
+ * (RTC-less hardware sent epoch-1970 before). */
+static int test_din_session_setup_timestamp_gate(void) {
+    uint8_t sid[din_sessionIDType_BYTES_SIZE];
+    static const uint8_t evse_id[] = {'J','P','1'};
+    uint8_t exi[JPV2G_MAX_EXI_SIZE];
+    size_t exi_len = 0;
+    for (size_t i = 0; i < sizeof(sid); ++i) sid[i] = (uint8_t)(i + 1);
+
+    if (assert_true(jpv2g_cbv2g_encode_din_session_setup_res(
+                        sid, evse_id, sizeof(evse_id),
+                        din_responseCodeType_OK_NewSessionEstablished, -1,
+                        exi, sizeof(exi), &exi_len) == 0,
+                    "DIN SessionSetupRes encodes with absent timestamp") != 0) return 1;
+    {
+        struct din_exiDocument doc;
+        exi_bitstream_t stream;
+        exi_bitstream_init(&stream, exi, exi_len, 0, NULL);
+        if (assert_true(decode_din_exiDocument(&stream, &doc) == 0 &&
+                            doc.V2G_Message.Body.SessionSetupRes_isUsed,
+                        "absent-timestamp DIN SessionSetupRes decodes") != 0) return 1;
+        if (assert_true(doc.V2G_Message.Body.SessionSetupRes.DateTimeNow_isUsed == 0,
+                        "negative timestamp omits DateTimeNow (gap #10)") != 0) return 1;
+    }
+    if (assert_true(jpv2g_cbv2g_encode_din_session_setup_res(
+                        sid, evse_id, sizeof(evse_id),
+                        din_responseCodeType_OK_NewSessionEstablished, 1752969600,
+                        exi, sizeof(exi), &exi_len) == 0,
+                    "DIN SessionSetupRes encodes with real timestamp") != 0) return 1;
+    {
+        struct din_exiDocument doc;
+        exi_bitstream_t stream;
+        exi_bitstream_init(&stream, exi, exi_len, 0, NULL);
+        if (assert_true(decode_din_exiDocument(&stream, &doc) == 0 &&
+                            doc.V2G_Message.Body.SessionSetupRes.DateTimeNow_isUsed == 1,
+                        "real timestamp keeps DateTimeNow") != 0) return 1;
+    }
+    return 0;
+}
+
+/* Gap audit #12: a payment option we never offered must be rejected with
+ * FAILED_PaymentSelectionInvalid — via handler rc 0 so the Res transmits. */
+static int test_payment_selection_rejects_unoffered(void) {
+    jpv2g_codec_ctx *codec = NULL;
+    jpv2g_secc_config_t cfg;
+    jpv2g_secc_t secc;
+    uint8_t out[JPV2G_MAX_EXI_SIZE];
+    size_t out_len = 0;
+
+    jpv2g_secc_config_default(&cfg);
+    if (assert_true(jpv2g_codec_init(&codec) == 0, "codec init for payment test") != 0) return 1;
+    if (assert_true(jpv2g_secc_init(&secc, &cfg, codec) == 0, "SECC init for payment test") != 0) {
+        jpv2g_codec_free(codec);
+        return 1;
+    }
+
+    struct iso2_MessageHeaderType header;
+    memset(&header, 0, sizeof(header));
+    header.SessionID.bytesLen = iso2_sessionIDType_BYTES_SIZE;
+    for (size_t i = 0; i < iso2_sessionIDType_BYTES_SIZE; ++i) {
+        header.SessionID.bytes[i] = (uint8_t)(i + 1);
+    }
+    struct iso2_PaymentServiceSelectionReqType psreq;
+    memset(&psreq, 0, sizeof(psreq));
+    psreq.SelectedPaymentOption = iso2_paymentOptionType_Contract;
+
+    jpv2g_secc_request_t req;
+    memset(&req, 0, sizeof(req));
+    req.protocol = JPV2G_PROTOCOL_ISO15118_2;
+    req.header = &header;
+    req.body = &psreq;
+
+    const int rc = jpv2g_secc_default_handle(
+        &secc, JPV2G_PAYMENT_SERVICE_SELECTION_REQ, &req, out, sizeof(out), &out_len);
+    if (assert_true(rc == 0 && out_len > 0,
+                    "Contract selection answered (rc 0), not torn down") != 0) return 1;
+    struct iso2_PaymentServiceSelectionResType res;
+    if (assert_true(jpv2g_cbv2g_decode_payment_service_selection_res(out, out_len, &res) == 0,
+                    "payment-selection Res decodes") != 0) return 1;
+    if (assert_true(res.ResponseCode == iso2_responseCodeType_FAILED_PaymentSelectionInvalid,
+                    "Contract selection rejected with FAILED_PaymentSelectionInvalid") != 0) return 1;
+
+    /* ExternalPayment stays OK. */
+    psreq.SelectedPaymentOption = iso2_paymentOptionType_ExternalPayment;
+    if (assert_true(jpv2g_secc_default_handle(
+                        &secc, JPV2G_PAYMENT_SERVICE_SELECTION_REQ, &req,
+                        out, sizeof(out), &out_len) == 0 &&
+                        jpv2g_cbv2g_decode_payment_service_selection_res(out, out_len, &res) == 0 &&
+                        res.ResponseCode == iso2_responseCodeType_OK,
+                    "ExternalPayment still answered OK") != 0) return 1;
+
+    jpv2g_codec_free(codec);
     return 0;
 }
 
@@ -1895,6 +2211,11 @@ int main(void) {
     if (test_iso_pause_resume() != 0) return 1;
     if (test_secc_session_id_validation() != 0) return 1;
     if (test_secc_stream_enforces_sequence() != 0) return 1;
+    if (test_secc_min_failed_res_is_decodable() != 0) return 1;
+    if (test_secc_stream_sends_failed_res_before_teardown() != 0) return 1;
+    if (test_secc_stream_ignores_undecodable_midsession() != 0) return 1;
+    if (test_din_session_setup_timestamp_gate() != 0) return 1;
+    if (test_payment_selection_rejects_unoffered() != 0) return 1;
 #endif
     printf("jpv2g_unit_test: PASS\n");
     return 0;

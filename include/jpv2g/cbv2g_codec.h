@@ -11,6 +11,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "jpv2g/messages.h"
+#include "jpv2g/types.h"
+
 #ifdef JPV2G_ENABLE_CBV2G_CODEC
 
 #include "cbv2g/app_handshake/appHand_Datatypes.h"
@@ -378,6 +381,34 @@ int jpv2g_cbv2g_encode_din_cable_check_res(const uint8_t session_id[din_sessionI
                                              uint8_t *out,
                                              size_t out_len,
                                              size_t *written);
+
+/* Minimal per-message FAILED response ([V2G2-538]/[V2G2-460]/[V2G2-736],
+ * DIN [V2G-DC-665]). When the SECC rejects a request for a sequence violation
+ * or an unknown SessionID it must still answer with a schema-valid Res whose
+ * ResponseCode names the failure, THEN terminate — a silent TCP RST reads as
+ * "EVSE died" to the vehicle and several stacks retry-loop on it. The
+ * dispatcher reuses the existing per-message encoders (the same proven paths
+ * production responses take) with the FAILED code and, for the DC energy
+ * messages, an explicit fail-shaped DC_EVSEStatus (StopCharging notification,
+ * isolation Invalid) mirroring Josev's failed_responses tables. Covers every
+ * DIN + ISO2 message type the stream dispatcher can produce; returns -ENOTSUP
+ * for types that have their own response path (SupportedAppProtocol) so the
+ * caller falls back to plain termination. */
+typedef enum {
+    JPV2G_MIN_FAILED_SEQUENCE_ERROR = 0,
+    JPV2G_MIN_FAILED_UNKNOWN_SESSION = 1,
+} jpv2g_min_failed_kind_t;
+
+int jpv2g_cbv2g_encode_min_failed_res(jpv2g_protocol_t protocol,
+                                      jpv2g_message_type_t message_type,
+                                      jpv2g_min_failed_kind_t kind,
+                                      const uint8_t session_id[iso2_sessionIDType_BYTES_SIZE],
+                                      const char *iso_evse_id,
+                                      const uint8_t *din_evse_id,
+                                      size_t din_evse_id_len,
+                                      uint8_t *out,
+                                      size_t out_len,
+                                      size_t *written);
 
 #else
 /* cbv2g codec is disabled for this build. */

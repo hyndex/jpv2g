@@ -900,9 +900,24 @@ int jpv2g_secc_validate_request_session(const jpv2g_secc_t *secc,
 
     /* SessionSetup establishes or resumes the session. Both the omitted SID
      * form and the fixed-width resume candidate are valid inputs; the default
-     * handler decides whether the candidate is actually resumable. */
+     * handler decides whether the candidate is actually resumable.
+     *
+     * 2026-07-20 V2G gap audit #2: accept ANY SessionID length up to 8 bytes,
+     * not just 0 or exactly 8. Three independent references corroborate short
+     * SIDs in the field — RISE-V2G's own EVCC sends a 1-byte 0x00 SID at
+     * SessionSetup (V2GCommunicationSessionSECC.java:224-253), EvseV2G
+     * zero-pads short SIDs with an explicit field-experience comment
+     * (v2g_server.cpp:628-649), Josev decodes any length <= 8. We used to
+     * -EINVAL -> silent TCP drop before any Res, so any RISE-derived EV stack
+     * was hard-stranded with total silence through every retry.
+     * secc_resolve_session already classifies a non-8-byte SID as "no SID" and
+     * answers with a fresh SECC SID + OK_NewSessionEstablished — exactly the
+     * RISE/Josev semantics. Deliberately NOT padded into the pause-resume
+     * comparison: which end truncated is undefined, and a false
+     * OK_OldSessionJoined is worse than a fresh session; resume stays strictly
+     * 8-byte. Lengths > 8 cannot decode (schema caps the byte array at 8). */
     if (type == JPV2G_SESSION_SETUP_REQ) {
-        return (incoming_len == 0 || incoming_len == sizeof(secc->session_id)) ? 0 : -EINVAL;
+        return (incoming_len <= sizeof(secc->session_id)) ? 0 : -EINVAL;
     }
 
     if (incoming_len != sizeof(secc->session_id) ||
@@ -1198,6 +1213,18 @@ static const void *secc_copy_req_body_for_log(jpv2g_protocol_t protocol,
     return body;
 }
 
+/* 2026-07-20 V2G gap audit #10 (EvseV2G din_server.cpp:362-363, config-gated
+ * default-off): only report DateTimeNow when the platform actually has a wall
+ * clock. The ESP32-S3 PLC has no RTC/NTP, so time(NULL) is seconds-since-boot
+ * — every DIN session used to receive an epoch-1970 timestamp. A negative
+ * value makes the encoder omit the optional field entirely (the honest
+ * answer); the field reappears automatically on any platform whose clock is
+ * plausibly real (past 2020-01-01). */
+static int64_t secc_wallclock_or_absent(void) {
+    const time_t now = time(NULL);
+    return (now > (time_t)1577836800) ? (int64_t)now : -1;
+}
+
 int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
                                 jpv2g_message_type_t type,
                                 const jpv2g_secc_request_t *req,
@@ -1255,7 +1282,7 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
                                                                  kDinEvseId,
                                                                  sizeof(kDinEvseId),
                                                                  code,
-                                                                 (int64_t)time(NULL),
+                                                                 secc_wallclock_or_absent(),
                                                                  out,
                                                                  out_len,
                                                                  written);
@@ -1351,17 +1378,46 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
                 sid, iso2_responseCodeType_OK, requested_service_id, NULL, out, out_len, written);
         }
         case JPV2G_PAYMENT_SERVICE_SELECTION_REQ: {
+            /* 2026-07-20 V2G gap audit #12 (RISE-V2G
+             * WaitForPaymentServiceSelectionReq.java:89-132): the selected
+             * payment option must actually have been offered. We advertise
+             * ExternalPayment ONLY, so a Contract-selecting EV must get
+             * FAILED_PaymentSelectionInvalid — the old unconditional OK let it
+             * sail into authorization as pseudo-EIM (PaymentDetails is
+             * optional per the DIN state table, so nothing downstream caught
+             * it). Encode the FAILED Res and return 0: a non-zero handler rc
+             * tears the stream down BEFORE the Res transmits (the VEH-3
+             * lesson). The SelectedServiceList walk stays deliberately lenient
+             * (VEH-3: never punish a quirky EV for its ServiceID bookkeeping). */
             if (req->protocol == JPV2G_PROTOCOL_DIN70121) {
-                return jpv2g_cbv2g_encode_din_service_payment_selection_res(sid, din_responseCodeType_OK, out, out_len, written);
+                din_responseCodeType code = din_responseCodeType_OK;
+                if (req->body) {
+                    const struct din_ServicePaymentSelectionReqType *rq =
+                        (const struct din_ServicePaymentSelectionReqType *)req->body;
+                    if (rq->SelectedPaymentOption != din_paymentOptionType_ExternalPayment) {
+                        code = din_responseCodeType_FAILED_PaymentSelectionInvalid;
+                    }
+                }
+                return jpv2g_cbv2g_encode_din_service_payment_selection_res(sid, code, out, out_len, written);
             }
-            return jpv2g_cbv2g_encode_payment_service_selection_res(sid, iso2_responseCodeType_OK, out, out_len, written);
+            iso2_responseCodeType code = iso2_responseCodeType_OK;
+            if (req->body) {
+                const struct iso2_PaymentServiceSelectionReqType *rq =
+                    (const struct iso2_PaymentServiceSelectionReqType *)req->body;
+                if (rq->SelectedPaymentOption != iso2_paymentOptionType_ExternalPayment) {
+                    code = iso2_responseCodeType_FAILED_PaymentSelectionInvalid;
+                }
+            }
+            return jpv2g_cbv2g_encode_payment_service_selection_res(sid, code, out, out_len, written);
         }
         case JPV2G_PAYMENT_DETAILS_REQ: {
             bool ok = secc->backend.authorize_contract
                           ? secc->backend.authorize_contract(secc->backend.user_ctx)
                           : false;
             if (req->protocol == JPV2G_PROTOCOL_DIN70121) {
-                return jpv2g_cbv2g_encode_din_payment_details_res(sid, ok ? din_responseCodeType_OK : din_responseCodeType_FAILED, NULL, (int64_t)time(NULL), out, out_len, written);
+                /* Gap audit #10: same RTC-less DateTimeNow gate as SessionSetup
+                 * (dead path in EIM, kept for the invariant). */
+                return jpv2g_cbv2g_encode_din_payment_details_res(sid, ok ? din_responseCodeType_OK : din_responseCodeType_FAILED, NULL, secc_wallclock_or_absent(), out, out_len, written);
             }
             return jpv2g_cbv2g_encode_payment_details_res(sid, ok ? iso2_responseCodeType_OK : iso2_responseCodeType_FAILED, NULL, 0, time(NULL), out, out_len, written);
         }
@@ -1491,6 +1547,15 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
             return jpv2g_cbv2g_encode_power_delivery_res(sid, iso2_responseCodeType_OK, NULL, out, out_len, written);
         }
         case JPV2G_CHARGING_STATUS_REQ: {
+            /* 2026-07-20 V2G gap audit #11: this was the only handler with no
+             * protocol branch — a DIN session's ChargingStatusReq (the DIN XSD
+             * retained the ISO-draft AC messages, so the decode path CAN
+             * produce it) would have been answered with ISO2-encoded bytes.
+             * Near-zero exposure (requires a DIN EV that skipped CableCheck),
+             * but genuinely wrong on the wire; -EPROTO gives the same outcome
+             * as today's sequence-gate rejection of the AC path. EvseV2G
+             * likewise IGNOREs DIN ChargingStatusReq (din_server.cpp:1080). */
+            if (req->protocol == JPV2G_PROTOCOL_DIN70121) return -EPROTO;
             return jpv2g_cbv2g_encode_charging_status_res(sid, iso2_responseCodeType_OK, "EVSE_ID_1", 1, NULL, out, out_len, written);
         }
         case JPV2G_CURRENT_DEMAND_REQ: {
@@ -1779,6 +1844,57 @@ static int jpv2g_secc_handle_stream(jpv2g_secc_t *secc,
     return jpv2g_secc_handle_stream_obs(secc, recv_fn, recv_ctx, send_fn, send_ctx, timeout_ms, NULL);
 }
 
+/* 2026-07-20 V2G gap audit #3 ([V2G2-538]/[V2G2-460]/[V2G2-539], DIN
+ * [V2G-DC-665]): best-effort transmission of a minimal decodable FAILED Res
+ * before the stream tears down on a sequence violation or unknown SessionID.
+ * Every reference SECC (EvseV2G, Josev, RISE-V2G) answers first and
+ * terminates second; a silent TCP RST reads as "EVSE died" to the vehicle and
+ * several EV stacks retry-loop on it. This helper reuses the caller's EXI
+ * scratch buffer (no new 4 KB frame on the HLC stack) and writes the 8-byte
+ * V2GTP header separately — TCP is a stream, two writes are equivalent to
+ * one. Failures here are ignored: the caller's exit rc, last_reject_* EVT
+ * telemetry, and drop-reason mapping stay byte-identical either way. */
+#define SECC_MIN_FAILED_SEND_TIMEOUT_MS 2000
+
+static void secc_send_min_failed(jpv2g_secc_t *secc,
+                                 secc_send_fn send_fn,
+                                 void *send_ctx,
+                                 jpv2g_protocol_t protocol,
+                                 jpv2g_message_type_t mtype,
+                                 jpv2g_min_failed_kind_t kind,
+                                 uint8_t *scratch,
+                                 size_t scratch_len) {
+    /* Same identities the default handler advertises (function-local statics
+     * there; duplicated here as flash constants to avoid reordering code). */
+    static const char kIsoEvseIdMinFailed[] = "IN*JPE*E000100010001";
+    static const uint8_t kDinEvseIdMinFailed[] = {
+        'J','P','E','V','S','E','0','0','0','1','0','0','1','0','0','0','1','0'
+    };
+    if (!secc || !send_fn || !scratch) return;
+    size_t exi_len = 0;
+    if (jpv2g_cbv2g_encode_min_failed_res(protocol, mtype, kind,
+                                          secc->session_id,
+                                          kIsoEvseIdMinFailed,
+                                          kDinEvseIdMinFailed,
+                                          sizeof(kDinEvseIdMinFailed),
+                                          scratch, scratch_len,
+                                          &exi_len) != 0 ||
+        exi_len == 0) {
+        return;
+    }
+    uint8_t hdr[JPV2G_V2GTP_HEADER_LEN];
+    hdr[0] = JPV2G_V2GTP_VERSION;
+    hdr[1] = (uint8_t)(JPV2G_V2GTP_VERSION ^ 0xFF);
+    jpv2g_write_u16_be(&hdr[2], (uint16_t)JPV2G_PAYLOAD_EXI);
+    jpv2g_write_u32_be(&hdr[4], (uint32_t)exi_len);
+    if (secc_send_bytes(send_fn, send_ctx, hdr, sizeof(hdr),
+                        SECC_MIN_FAILED_SEND_TIMEOUT_MS) != 0) {
+        return;
+    }
+    (void)secc_send_bytes(send_fn, send_ctx, scratch, exi_len,
+                          SECC_MIN_FAILED_SEND_TIMEOUT_MS);
+}
+
 static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
                                           secc_recv_fn recv_fn,
                                           void *recv_ctx,
@@ -1798,6 +1914,8 @@ static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
     jpv2g_protocol_t protocol = JPV2G_PROTOCOL_UNKNOWN;
     bool handled_any = false;
     bool saw_session_stop = false;
+    /* Gap audit #9: bounded tolerance for undecodable mid-session frames. */
+    unsigned consecutive_undecodable = 0;
     jpv2g_message_type_t last_msg = JPV2G_UNKNOWN_MESSAGE;
     jpv2g_secc_sequence_t sequence;
     jpv2g_secc_sequence_init(&sequence);
@@ -1991,17 +2109,32 @@ static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
             }
         }
 
-        if (mtype == JPV2G_UNKNOWN_MESSAGE) {
-            /* Fallback: echo */
-            if (msg.payload_length > sizeof(out_payload)) SECC_STREAM_EXIT(-ENOSPC);
-            memcpy(out_payload, msg.payload, msg.payload_length);
-            out_len = msg.payload_length;
-        }
-
         if (!decoded_ok) {
+            /* 2026-07-20 V2G gap audit #9 (EvseV2G v2g_server.cpp:493-517
+             * "we must ignore packet which we cannot decode"): a mid-session
+             * frame that fails all three decoders — a nonconformant EV EXI
+             * encoder, or a decodable-but-undispatched probe such as
+             * CertificateInstallationReq from a PnC-attempting EV — used to
+             * tear down the whole live session (-EBADMSG). Ignore it and stay
+             * in the receive loop instead, BOUNDED: incoming bytes reset the
+             * idle timeout (secc_recv_v2gtp), so an unbounded ignore would let
+             * a babbling peer pin the worker forever. The cap resets on every
+             * successfully dispatched message. Pre-session garbage (nothing
+             * handled yet) still tears down immediately — the stream may be
+             * desynced from the very first byte. The old "echo" fallback that
+             * lived here was dead code (mtype==UNKNOWN always implied
+             * !decoded_ok, which exited before the echo could be sent). */
+            if (handled_any && consecutive_undecodable < 6u) {
+                ++consecutive_undecodable;
+                JPV2G_WARN("Ignoring undecodable EXI frame %u/6 (payload_len=%u)",
+                           (unsigned)consecutive_undecodable,
+                           (unsigned)msg.payload_length);
+                continue;
+            }
             JPV2G_WARN("Failed to decode EXI message (payload_len=%u)", (unsigned)msg.payload_length);
             SECC_STREAM_EXIT(-EBADMSG);
         }
+        consecutive_undecodable = 0;
 
         rc = secc_accept_request_sequence(&sequence, mtype, &req_ctx);
         if (rc != 0) {
@@ -2013,6 +2146,10 @@ static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
             secc->last_reject_phase = (int)sequence.phase;
             secc->last_reject_type = (int)mtype;
             secc->last_reject_protocol = (int)req_ctx.protocol;
+            /* Gap audit #3: answer FAILED_SequenceError, THEN terminate. */
+            secc_send_min_failed(secc, send_fn, send_ctx, req_ctx.protocol,
+                                 mtype, JPV2G_MIN_FAILED_SEQUENCE_ERROR,
+                                 out_payload, sizeof(out_payload));
             SECC_STREAM_EXIT(rc);
         }
         rc = jpv2g_secc_validate_request_session(secc, mtype, &req_ctx);
@@ -2021,6 +2158,10 @@ static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
                        secc_msg_name(mtype),
                        (int)req_ctx.protocol,
                        rc);
+            /* Gap audit #3: answer FAILED_UnknownSession, THEN terminate. */
+            secc_send_min_failed(secc, send_fn, send_ctx, req_ctx.protocol,
+                                 mtype, JPV2G_MIN_FAILED_UNKNOWN_SESSION,
+                                 out_payload, sizeof(out_payload));
             SECC_STREAM_EXIT(rc);
         }
 

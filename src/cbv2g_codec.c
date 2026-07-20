@@ -2182,3 +2182,160 @@ int jpv2g_cbv2g_encode_din_cable_check_res(const uint8_t session_id[din_sessionI
     if (written) *written = exi_bitstream_get_length(&stream);
     return 0;
 }
+
+/* ===== Minimal per-message FAILED responses ([V2G2-538]/[V2G2-460]) =========
+ *
+ * 2026-07-20 V2G gap audit (vs EvseV2G iso_server.cpp:44-101 / Josev
+ * secc_state.py:246-369 + failed_responses.py / RISE-V2G ServerState.java):
+ * every reference answers a sequence-violating or unknown-SessionID request
+ * with a decodable Res carrying FAILED_SequenceError / FAILED_UnknownSession
+ * and THEN terminates. We used to silently drop TCP, which several EV stacks
+ * treat as "EVSE died" and retry-loop on.
+ *
+ * Implementation choice: each arm reuses the existing per-message encoder with
+ * a NULL payload — the same default-fill paths every production Res already
+ * exercises — so no new field combination is introduced on the wire. The only
+ * novelty is the ResponseCode value, which is exactly the point. ccs32clara
+ * (pevStateMachine.cpp) shows EVs that check only <Res>_isUsed and ignore
+ * ResponseCode entirely, so the caller MUST still terminate after sending
+ * (send-then-terminate, [V2G2-539]); staying in the loop would run a zombie
+ * sequence on such EVs. */
+int jpv2g_cbv2g_encode_min_failed_res(jpv2g_protocol_t protocol,
+                                      jpv2g_message_type_t message_type,
+                                      jpv2g_min_failed_kind_t kind,
+                                      const uint8_t session_id[iso2_sessionIDType_BYTES_SIZE],
+                                      const char *iso_evse_id,
+                                      const uint8_t *din_evse_id,
+                                      size_t din_evse_id_len,
+                                      uint8_t *out,
+                                      size_t out_len,
+                                      size_t *written) {
+    if (!session_id || !out) return -EINVAL;
+
+    if (protocol == JPV2G_PROTOCOL_DIN70121) {
+        const din_responseCodeType code =
+            (kind == JPV2G_MIN_FAILED_UNKNOWN_SESSION)
+                ? din_responseCodeType_FAILED_UnknownSession
+                : din_responseCodeType_FAILED_SequenceError;
+        switch (message_type) {
+            case JPV2G_SESSION_SETUP_REQ:
+                return jpv2g_cbv2g_encode_din_session_setup_res(
+                    session_id, din_evse_id, din_evse_id_len, code, -1,
+                    out, out_len, written);
+            case JPV2G_SERVICE_DISCOVERY_REQ:
+                return jpv2g_cbv2g_encode_din_service_discovery_res(
+                    session_id, code, din_paymentOptionType_ExternalPayment,
+                    din_EVSESupportedEnergyTransferType_DC_extended, 1, NULL, 0,
+                    out, out_len, written);
+            case JPV2G_SERVICE_DETAIL_REQ:
+                return jpv2g_cbv2g_encode_din_service_detail_res(
+                    session_id, code, 1, out, out_len, written);
+            case JPV2G_PAYMENT_SERVICE_SELECTION_REQ:
+                return jpv2g_cbv2g_encode_din_service_payment_selection_res(
+                    session_id, code, out, out_len, written);
+            case JPV2G_PAYMENT_DETAILS_REQ:
+                return jpv2g_cbv2g_encode_din_payment_details_res(
+                    session_id, code, NULL, -1, out, out_len, written);
+            case JPV2G_AUTHORIZATION_REQ:
+                return jpv2g_cbv2g_encode_din_contract_authentication_res(
+                    session_id, code, din_EVSEProcessingType_Finished,
+                    out, out_len, written);
+            case JPV2G_CHARGE_PARAMETER_DISCOVERY_REQ:
+                return jpv2g_cbv2g_encode_din_charge_parameter_discovery_res(
+                    session_id, code, din_EVSEProcessingType_Finished, NULL,
+                    out, out_len, written);
+            case JPV2G_CABLE_CHECK_REQ:
+                return jpv2g_cbv2g_encode_din_cable_check_res(
+                    session_id, code, din_EVSEProcessingType_Finished, NULL,
+                    out, out_len, written);
+            case JPV2G_PRE_CHARGE_REQ:
+                return jpv2g_cbv2g_encode_din_pre_charge_res(
+                    session_id, code, NULL, out, out_len, written);
+            case JPV2G_POWER_DELIVERY_REQ:
+                return jpv2g_cbv2g_encode_din_power_delivery_res(
+                    session_id, code, NULL, out, out_len, written);
+            case JPV2G_CURRENT_DEMAND_REQ:
+                return jpv2g_cbv2g_encode_din_current_demand_res(
+                    session_id, code, NULL, out, out_len, written);
+            case JPV2G_METERING_RECEIPT_REQ:
+                return jpv2g_cbv2g_encode_din_metering_receipt_res(
+                    session_id, code, NULL, out, out_len, written);
+            case JPV2G_WELDING_DETECTION_REQ:
+                return jpv2g_cbv2g_encode_din_welding_detection_res(
+                    session_id, code, NULL, out, out_len, written);
+            case JPV2G_SESSION_STOP_REQ:
+                return jpv2g_cbv2g_encode_din_session_stop_res(
+                    session_id, code, out, out_len, written);
+            default:
+                /* SupportedAppProtocol has its own response path; DIN
+                 * ChargingStatus has no DIN Res helper (a DIN EV sending it is
+                 * already pathological) — plain termination for both. */
+                return -ENOTSUP;
+        }
+    }
+
+    if (protocol == JPV2G_PROTOCOL_ISO15118_2) {
+        const iso2_responseCodeType code =
+            (kind == JPV2G_MIN_FAILED_UNKNOWN_SESSION)
+                ? iso2_responseCodeType_FAILED_UnknownSession
+                : iso2_responseCodeType_FAILED_SequenceError;
+        switch (message_type) {
+            case JPV2G_SESSION_SETUP_REQ:
+                return jpv2g_cbv2g_encode_session_setup_res(
+                    session_id, iso_evse_id ? iso_evse_id : "JP", code,
+                    out, out_len, written);
+            case JPV2G_SERVICE_DISCOVERY_REQ:
+                return jpv2g_cbv2g_encode_service_discovery_res(
+                    session_id, code, iso2_paymentOptionType_ExternalPayment,
+                    iso2_EnergyTransferModeType_DC_extended, 1, "DCFC", 0,
+                    out, out_len, written);
+            case JPV2G_SERVICE_DETAIL_REQ:
+                return jpv2g_cbv2g_encode_service_detail_res(
+                    session_id, code, 1, NULL, out, out_len, written);
+            case JPV2G_PAYMENT_SERVICE_SELECTION_REQ:
+                return jpv2g_cbv2g_encode_payment_service_selection_res(
+                    session_id, code, out, out_len, written);
+            case JPV2G_PAYMENT_DETAILS_REQ:
+                return jpv2g_cbv2g_encode_payment_details_res(
+                    session_id, code, NULL, 0, -1, out, out_len, written);
+            case JPV2G_AUTHORIZATION_REQ:
+                return jpv2g_cbv2g_encode_authorization_res(
+                    session_id, code, iso2_EVSEProcessingType_Finished,
+                    out, out_len, written);
+            case JPV2G_CHARGE_PARAMETER_DISCOVERY_REQ:
+                return jpv2g_cbv2g_encode_charge_parameter_discovery_res(
+                    session_id, code, iso2_EnergyTransferModeType_DC_extended,
+                    out, out_len, written);
+            case JPV2G_CABLE_CHECK_REQ:
+                return jpv2g_cbv2g_encode_cable_check_res(
+                    session_id, code, iso2_EVSEProcessingType_Finished, NULL,
+                    out, out_len, written);
+            case JPV2G_PRE_CHARGE_REQ:
+                return jpv2g_cbv2g_encode_pre_charge_res(
+                    session_id, code, NULL, out, out_len, written);
+            case JPV2G_POWER_DELIVERY_REQ:
+                return jpv2g_cbv2g_encode_power_delivery_res(
+                    session_id, code, NULL, out, out_len, written);
+            case JPV2G_CHARGING_STATUS_REQ:
+                return jpv2g_cbv2g_encode_charging_status_res(
+                    session_id, code, iso_evse_id ? iso_evse_id : "JP", 1, NULL,
+                    out, out_len, written);
+            case JPV2G_CURRENT_DEMAND_REQ:
+                return jpv2g_cbv2g_encode_current_demand_res(
+                    session_id, code, NULL, out, out_len, written);
+            case JPV2G_METERING_RECEIPT_REQ:
+                return jpv2g_cbv2g_encode_metering_receipt_res(
+                    session_id, code, NULL, out, out_len, written);
+            case JPV2G_WELDING_DETECTION_REQ:
+                return jpv2g_cbv2g_encode_welding_detection_res(
+                    session_id, code, NULL, out, out_len, written);
+            case JPV2G_SESSION_STOP_REQ:
+                return jpv2g_cbv2g_encode_session_stop_res(
+                    session_id, code, out, out_len, written);
+            default:
+                return -ENOTSUP;
+        }
+    }
+
+    return -ENOTSUP;
+}
