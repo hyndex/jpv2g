@@ -35,6 +35,9 @@
 #include "jpv2g/log.h"
 #include "jpv2g/time_compat.h"
 #include "cbv2g_workspace.h"
+#ifdef JPV2G_ENABLE_ISO20
+#include "jpv2g/secc_iso20.h"
+#endif
 
 static bool s_enable_decoded_logs = true;
 static bool s_enable_timing_logs = true;
@@ -123,12 +126,29 @@ static bool app_protocol_offer_matches(const struct appHand_AppProtocolType *ap,
     if (protocol == JPV2G_PROTOCOL_DIN70121) {
         return ns_contains(ns, ns_len, "din:70121");
     }
+#ifdef JPV2G_ENABLE_ISO20
+    if (protocol == JPV2G_PROTOCOL_ISO15118_20_DC) {
+        /* Exact-namespace match only. Deliberately NOT a startswith-base rule
+         * (SwitchEV-style): that would also accept the :AC/:WPT/:ACDP -20
+         * namespaces, which this DC-only SECC must reject. The -20 candidate
+         * additionally requires a registered secc20 session context, so a
+         * flag-on build whose firmware never wired the module keeps behaving
+         * exactly like a flag-off build (EV falls back to -2/DIN) instead of
+         * accepting an offer it cannot serve. */
+        static const char kIso20DcNamespace[] = JPV2G_SECC20_NAMESPACE_DC;
+        if (jpv2g_secc20_stream_session() == NULL) return false;
+        return ns_len == sizeof(kIso20DcNamespace) - 1 &&
+               memcmp(ns, kIso20DcNamespace, ns_len) == 0;
+    }
+#endif
     return false;
 }
 
 enum {
     SECC_SAPP_SUPPORTED_MAJOR = 2,
     SECC_SAPP_SUPPORTED_MINOR = 0,
+    /* ISO 15118-20 wire version is 1.0 — the major gate is per-candidate. */
+    SECC_SAPP_ISO20_SUPPORTED_MAJOR = 1,
 };
 
 typedef struct {
@@ -154,8 +174,22 @@ static secc_app_selection_t select_app_protocol(const struct appHand_supportedAp
         } else if (app_protocol_offer_matches(ap, JPV2G_PROTOCOL_DIN70121)) {
             candidate = JPV2G_PROTOCOL_DIN70121;
         }
+#ifdef JPV2G_ENABLE_ISO20
+        else if (app_protocol_offer_matches(ap, JPV2G_PROTOCOL_ISO15118_20_DC)) {
+            candidate = JPV2G_PROTOCOL_ISO15118_20_DC;
+        }
+#endif
+        /* Per-candidate major gate: ISO2/DIN negotiate wire major 2, -20 DC
+         * negotiates major 1. The EV's Priority (lower = higher) still decides
+         * between mutually supported candidates — no SECC-side preference. */
+        uint32_t supported_major = SECC_SAPP_SUPPORTED_MAJOR;
+#ifdef JPV2G_ENABLE_ISO20
+        if (candidate == JPV2G_PROTOCOL_ISO15118_20_DC) {
+            supported_major = SECC_SAPP_ISO20_SUPPORTED_MAJOR;
+        }
+#endif
         if (candidate == JPV2G_PROTOCOL_UNKNOWN ||
-            ap->VersionNumberMajor != SECC_SAPP_SUPPORTED_MAJOR) {
+            ap->VersionNumberMajor != supported_major) {
             continue;
         }
 
@@ -1900,6 +1934,26 @@ static void secc_send_min_failed(jpv2g_secc_t *secc,
                           SECC_MIN_FAILED_SEND_TIMEOUT_MS);
 }
 
+#ifdef JPV2G_ENABLE_ISO20
+/* [V2G20-1643] teardown hold: after the final -20 response (SessionStopRes,
+ * any FAILED, sequence error, or a silent SEQUENCE-timeout teardown) the SECC
+ * must keep the TCP link open ~5 s and discard whatever the EV still sends,
+ * so a slow EVCC never sees its last request answered by a RST. Bounded by
+ * the deadline; an orderly peer close or socket error ends it early. */
+static void secc_iso20_teardown_hold(secc_recv_fn recv_fn, void *recv_ctx) {
+    uint8_t sink[128];
+    const int64_t deadline = jpv2g_now_monotonic_ms() + JPV2G_SECC20_TEARDOWN_HOLD_MS;
+    for (;;) {
+        const int64_t remaining = deadline - jpv2g_now_monotonic_ms();
+        if (remaining <= 0) return;
+        ssize_t r = recv_fn(recv_ctx, sink, sizeof(sink),
+                            remaining > INT32_MAX ? INT32_MAX : (int)remaining);
+        if (r == -EAGAIN || r == -EINTR) continue;
+        if (r <= 0) return; /* peer closed, error, or timeout reached */
+    }
+}
+#endif /* JPV2G_ENABLE_ISO20 */
+
 static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
                                           secc_recv_fn recv_fn,
                                           void *recv_ctx,
@@ -1941,6 +1995,73 @@ static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
         }
         if (rc == -EAGAIN) SECC_STREAM_EXIT(0); /* graceful idle exit */
         if (rc != 0) SECC_STREAM_EXIT(rc);
+#ifdef JPV2G_ENABLE_ISO20
+        /* Once SupportedAppProtocol selected -20, every non-SAP frame is a
+         * -20 mainstream request (0x8002 CommonMessages / 0x8004 DC) owned by
+         * the secc20 module: it decodes, sequence/session-gates, answers, and
+         * reports whether the session survives. A 0x8001 frame still falls
+         * through to the legacy path below so a SAP retry stays possible. */
+        if (protocol == JPV2G_PROTOCOL_ISO15118_20_DC &&
+            msg.payload_type != JPV2G_PAYLOAD_EXI) {
+            jpv2g_secc20_t *s20 = jpv2g_secc20_stream_session();
+            if (!s20) SECC_STREAM_EXIT(-ENOTSUP); /* unreachable: matching requires it */
+            if (msg.payload_type != JPV2G_PAYLOAD_EXI_20_MAINSTREAM &&
+                msg.payload_type != JPV2G_PAYLOAD_EXI_20_DC) {
+                SECC_STREAM_EXIT(-EBADMSG);
+            }
+            uint8_t iso20_res[JPV2G_MAX_EXI_SIZE];
+            size_t iso20_res_len = 0;
+            uint16_t iso20_res_pid = 0;
+            jpv2g_secc20_disposition_t disp = JPV2G_SECC20_CONTINUE;
+            int rc20 = jpv2g_secc20_handle_frame(s20, (uint16_t)msg.payload_type,
+                                                 msg.payload, msg.payload_length,
+                                                 iso20_res, sizeof(iso20_res),
+                                                 &iso20_res_len, &iso20_res_pid, &disp);
+            if (rc20 == -EBADMSG) {
+                /* Same bounded tolerance as gap audit #9 for -2/DIN: one
+                 * undecodable mid-session frame must not kill a live charge. */
+                if (handled_any && consecutive_undecodable < 6u) {
+                    ++consecutive_undecodable;
+                    JPV2G_WARN("Ignoring undecodable -20 frame %u/6 (payload_len=%u)",
+                               (unsigned)consecutive_undecodable,
+                               (unsigned)msg.payload_length);
+                    continue;
+                }
+                SECC_STREAM_EXIT(-EBADMSG);
+            }
+            if (rc20 == -ETIMEDOUT) {
+                /* SEQUENCE expiry: no response, but still hold before close. */
+                secc_iso20_teardown_hold(recv_fn, recv_ctx);
+                SECC_STREAM_EXIT(-ETIMEDOUT);
+            }
+            if (rc20 != 0) SECC_STREAM_EXIT(rc20);
+            consecutive_undecodable = 0;
+            uint8_t iso20_frame[JPV2G_V2GTP_HEADER_LEN + JPV2G_MAX_EXI_SIZE];
+            size_t iso20_total = 0;
+            rc = jpv2g_v2gtp_build((jpv2g_payload_type_t)iso20_res_pid,
+                                   iso20_res, iso20_res_len,
+                                   iso20_frame, sizeof(iso20_frame), &iso20_total);
+            if (rc != 0) SECC_STREAM_EXIT(rc);
+            rc = secc_send_bytes(send_fn, send_ctx, iso20_frame, iso20_total, timeout_ms);
+            if (rc != 0) SECC_STREAM_EXIT(rc);
+            handled_any = true;
+            JPV2G_INFO("TX ISO20 pid=0x%04x bytes=%u rc_code=%d disp=%d",
+                       (unsigned)iso20_res_pid, (unsigned)iso20_total,
+                       s20->last_response_code, (int)disp);
+            if (disp != JPV2G_SECC20_CONTINUE) {
+                secc_iso20_teardown_hold(recv_fn, recv_ctx);
+                if (disp == JPV2G_SECC20_DONE_STOPPED || disp == JPV2G_SECC20_DONE_PAUSED) {
+                    saw_session_stop = true;
+                    last_msg = JPV2G_SESSION_STOP_REQ;
+                    SECC_STREAM_EXIT(0);
+                }
+                /* A FAILED_* response was sent first (never a silent RST);
+                 * -EPROTO keeps the drop-reason classification meaningful. */
+                SECC_STREAM_EXIT(-EPROTO);
+            }
+            continue;
+        }
+#endif /* JPV2G_ENABLE_ISO20 */
         if (msg.payload_type != JPV2G_PAYLOAD_EXI) SECC_STREAM_EXIT(-EBADMSG);
         jpv2g_message_type_t mtype = JPV2G_UNKNOWN_MESSAGE;
         uint8_t out_payload[JPV2G_MAX_EXI_SIZE];
@@ -2203,6 +2324,17 @@ static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
         rc = secc_send_bytes(send_fn, send_ctx, out, total, timeout_ms);
         const int64_t send_finished_ms = jpv2g_now_monotonic_ms();
         if (rc != 0) SECC_STREAM_EXIT(rc);
+#ifdef JPV2G_ENABLE_ISO20
+        if (mtype == JPV2G_SUPP_APP_PROTOCOL_REQ &&
+            protocol == JPV2G_PROTOCOL_ISO15118_20_DC) {
+            /* -20 was selected and its SupportedAppProtocolRes just went out:
+             * re-arm the module for a fresh session. This is also where the
+             * -20 SEQUENCE timer legitimately starts (it must not run before
+             * SupportedAppProtocolReq). */
+            jpv2g_secc20_t *s20 = jpv2g_secc20_stream_session();
+            if (s20) jpv2g_secc20_reset(s20);
+        }
+#endif
         if (mtype != JPV2G_UNKNOWN_MESSAGE) {
             last_msg = mtype;
             if (mtype == JPV2G_SESSION_STOP_REQ) {
@@ -2268,10 +2400,20 @@ int jpv2g_secc_handle_client_tls(jpv2g_secc_t *secc,
     if (!secc || client_fd < 0) return -EINVAL;
     jpv2g_tls_socket_t sock;
     memset(&sock, 0, sizeof(sock));
-    const char *cert = cert_path ? cert_path : secc->cfg.tls_cert_path;
-    const char *key = key_path ? key_path : secc->cfg.tls_key_path;
-    const char *ca = ca_path ? ca_path : secc->cfg.tls_ca_path;
-    int rc = jpv2g_tls_server_wrap(&sock, client_fd, cert, key, ca);
+    int rc;
+    if (secc->cfg.tls_mem_creds.cert_pem != NULL) {
+        /* In-memory credentials take precedence over file paths: on the
+         * PLC there is no filesystem PKI, so a populated tls_mem_creds is
+         * the only way TLS can actually be served there. Explicit
+         * per-call paths still win for the file variant below. */
+        rc = jpv2g_tls_server_wrap_mem(&sock, client_fd, &secc->cfg.tls_mem_creds,
+                                       JPV2G_TLS_HANDSHAKE_TIMEOUT_MS);
+    } else {
+        const char *cert = cert_path ? cert_path : secc->cfg.tls_cert_path;
+        const char *key = key_path ? key_path : secc->cfg.tls_key_path;
+        const char *ca = ca_path ? ca_path : secc->cfg.tls_ca_path;
+        rc = jpv2g_tls_server_wrap(&sock, client_fd, cert, key, ca);
+    }
     if (rc != 0) {
         jpv2g_socket_close(client_fd);
         return rc;

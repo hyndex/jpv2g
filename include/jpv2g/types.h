@@ -40,5 +40,9 @@ typedef struct {
 typedef enum {
     JPV2G_PROTOCOL_UNKNOWN = 0,
     JPV2G_PROTOCOL_ISO15118_2,
-    JPV2G_PROTOCOL_DIN70121
+    JPV2G_PROTOCOL_DIN70121,
+    /* ISO 15118-20 DC (urn:iso:std:iso:15118:-20:DC). The member exists
+     * unconditionally (inert value, avoids ifdef-soup in headers); it is only
+     * ever selected when the library is built with JPV2G_ENABLE_ISO20. */
+    JPV2G_PROTOCOL_ISO15118_20_DC
 } jpv2g_protocol_t;

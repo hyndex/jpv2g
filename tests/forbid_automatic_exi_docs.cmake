@@ -10,7 +10,7 @@ file(READ "${SECC_SOURCE}" SECC_TEXT)
 # this source-level guard because an ordinary host test has ample stack and
 # would not reproduce the ESP32-S3 worker-creation failure.
 string(REGEX MATCH
-       "struct[ \t\r\n]+(appHand|iso2|din)_exiDocument[ \t\r\n]+[A-Za-z_][A-Za-z0-9_]*[ \t\r\n]*(\\[|;|=)"
+       "struct[ \t\r\n]+(appHand|iso20_dc|iso20|iso2|din)_exiDocument[ \t\r\n]+[A-Za-z_][A-Za-z0-9_]*[ \t\r\n]*(\\[|;|=)"
        AUTOMATIC_EXI_DECLARATION
        "${SECC_TEXT}")
 

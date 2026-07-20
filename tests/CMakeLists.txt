@@ -10,3 +10,20 @@ add_test(
             "-DSECC_SOURCE=${PROJECT_SOURCE_DIR}/src/secc.c"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/forbid_automatic_exi_docs.cmake"
 )
+
+if(JPV2G_ENABLE_ISO20)
+    add_executable(jpv2g_iso20_test jpv2g_iso20_test.c)
+    target_link_libraries(jpv2g_iso20_test PRIVATE jpv2g::jpv2g)
+    target_include_directories(jpv2g_iso20_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+
+    add_test(NAME jpv2g_iso20_test COMMAND jpv2g_iso20_test)
+
+    # The -20 documents are the largest of all (hundreds of KB): enforce the
+    # same no-automatic-exi-document rule on the module source.
+    add_test(
+        NAME jpv2g_no_automatic_iso20_exi_documents
+        COMMAND "${CMAKE_COMMAND}"
+                "-DSECC_SOURCE=${PROJECT_SOURCE_DIR}/src/secc_iso20.c"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/forbid_automatic_exi_docs.cmake"
+    )
+endif()

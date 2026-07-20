@@ -18,6 +18,11 @@
 
 typedef enum {
     JPV2G_PAYLOAD_EXI = 0x8001,
+    /* ISO 15118-20 mainstream payload ids. Members exist unconditionally
+     * (inert enum values, no behavior change); jpv2g_payload_type_supported()
+     * only accepts them when built with JPV2G_ENABLE_ISO20. */
+    JPV2G_PAYLOAD_EXI_20_MAINSTREAM = 0x8002, /* iso20 CommonMessages */
+    JPV2G_PAYLOAD_EXI_20_DC = 0x8004,         /* iso20 DC */
     JPV2G_PAYLOAD_SDP_REQ = 0x9000,
     JPV2G_PAYLOAD_SDP_RES = 0x9001
 } jpv2g_payload_type_t;

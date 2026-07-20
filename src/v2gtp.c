@@ -18,6 +18,14 @@ bool jpv2g_payload_type_supported(jpv2g_payload_type_t type) {
         case JPV2G_PAYLOAD_SDP_REQ:
         case JPV2G_PAYLOAD_SDP_RES:
             return true;
+#ifdef JPV2G_ENABLE_ISO20
+        /* -20 mainstream frames (0x8002 CommonMessages, 0x8004 DC). Flag off
+         * keeps these rejected exactly as before, so a -20-capable EV that
+         * somehow sends one is still torn down pre-negotiation. */
+        case JPV2G_PAYLOAD_EXI_20_MAINSTREAM:
+        case JPV2G_PAYLOAD_EXI_20_DC:
+            return true;
+#endif
         default:
             return false;
     }
