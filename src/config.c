@@ -67,4 +67,7 @@ void jpv2g_secc_config_default(jpv2g_secc_config_t *cfg) {
     set_pki_path(cfg->tls_cert_path, sizeof(cfg->tls_cert_path), "secc_chain.crt.pem");
     set_pki_path(cfg->tls_key_path, sizeof(cfg->tls_key_path), "secc_leaf.key.pem");
     set_pki_path(cfg->tls_ca_path, sizeof(cfg->tls_ca_path), "trust_v2g_roots.pem");
+    /* tls_mem_creds stays all-NULL from the memset above: in-memory
+     * credentials are opt-in and the accept path falls back to the file
+     * paths (and ultimately to refusing TLS) until a caller provides them. */
 }

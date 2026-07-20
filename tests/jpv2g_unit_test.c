@@ -2194,6 +2194,152 @@ static int test_secc_stream_enforces_sequence(void) {
 }
 #endif
 
+/* ------------------------------------------------------------------------- */
+/* TLS Tier-1: host-side tests that require NO mbedtls.                      */
+/*                                                                           */
+/* The jpv2g_tls_credentials_t contract (in-memory PEM, mbedtls 2.x rule:    */
+/* NUL-terminated buffer with the length counting the NUL) is enforced by    */
+/* jpv2g_tls_credentials_validate() in BOTH tls.c branches, so the shape     */
+/* checks are testable on hosts that never link mbedtls. The stub branch     */
+/* must keep refusing TLS with -ENOTSUP so the single-port auto-detect path  */
+/* (ClientHello -> wrap -> -ENOTSUP -> close) behaves exactly as shipped.    */
+/* ------------------------------------------------------------------------- */
+
+/* Structurally PEM-shaped fixtures; validation is shape-only, so the body
+ * content is irrelevant (parsing happens later, inside mbedtls builds). */
+static const char k_tls_test_cert_pem[] =
+    "-----BEGIN CERTIFICATE-----\nMIIBdummy\n-----END CERTIFICATE-----\n";
+static const char k_tls_test_key_pem[] =
+    "-----BEGIN EC PRIVATE KEY-----\nMHcdummy\n-----END EC PRIVATE KEY-----\n";
+static const char k_tls_test_ca_pem[] =
+    "-----BEGIN CERTIFICATE-----\nMIIBcadummy\n-----END CERTIFICATE-----\n";
+
+static jpv2g_tls_credentials_t tls_test_valid_creds(void) {
+    jpv2g_tls_credentials_t creds;
+    memset(&creds, 0, sizeof(creds));
+    creds.cert_pem = (const uint8_t *)k_tls_test_cert_pem;
+    creds.cert_pem_len = sizeof(k_tls_test_cert_pem); /* counts the NUL */
+    creds.key_pem = (const uint8_t *)k_tls_test_key_pem;
+    creds.key_pem_len = sizeof(k_tls_test_key_pem);
+    return creds;
+}
+
+static int test_tls_credentials_validation(void) {
+    if (assert_true(jpv2g_tls_credentials_validate(NULL) == -EINVAL,
+                    "NULL credentials must be rejected") != 0) return 1;
+
+    jpv2g_tls_credentials_t creds;
+    memset(&creds, 0, sizeof(creds));
+    if (assert_true(jpv2g_tls_credentials_validate(&creds) == -EINVAL,
+                    "all-NULL credentials must be rejected") != 0) return 1;
+
+    /* cert without key and key without cert are both incomplete. */
+    creds = tls_test_valid_creds();
+    creds.key_pem = NULL;
+    creds.key_pem_len = 0;
+    if (assert_true(jpv2g_tls_credentials_validate(&creds) == -EINVAL,
+                    "cert without key must be rejected") != 0) return 1;
+    creds = tls_test_valid_creds();
+    creds.cert_pem = NULL;
+    creds.cert_pem_len = 0;
+    if (assert_true(jpv2g_tls_credentials_validate(&creds) == -EINVAL,
+                    "key without cert must be rejected") != 0) return 1;
+
+    /* The happy path: sizeof(string literal) satisfies the NUL rule. */
+    creds = tls_test_valid_creds();
+    if (assert_true(jpv2g_tls_credentials_validate(&creds) == 0,
+                    "well-formed cert+key credentials must validate") != 0) return 1;
+
+    /* mbedtls 2.x PEM rule: the length must COUNT the terminating NUL.
+     * strlen()-style lengths (one short) are the classic integration bug
+     * and must be caught here, not as an opaque ASN.1 error later. */
+    creds = tls_test_valid_creds();
+    creds.cert_pem_len = sizeof(k_tls_test_cert_pem) - 1;
+    if (assert_true(jpv2g_tls_credentials_validate(&creds) == -EINVAL,
+                    "cert length not counting the NUL must be rejected") != 0) return 1;
+    creds = tls_test_valid_creds();
+    creds.key_pem_len = sizeof(k_tls_test_key_pem) - 1;
+    if (assert_true(jpv2g_tls_credentials_validate(&creds) == -EINVAL,
+                    "key length not counting the NUL must be rejected") != 0) return 1;
+
+    /* Empty PEM: a lone NUL (len 1) carries no content. */
+    static const char empty_pem[] = "";
+    creds = tls_test_valid_creds();
+    creds.cert_pem = (const uint8_t *)empty_pem;
+    creds.cert_pem_len = sizeof(empty_pem);
+    if (assert_true(jpv2g_tls_credentials_validate(&creds) == -EINVAL,
+                    "empty cert PEM must be rejected") != 0) return 1;
+
+    /* CA chain is optional, but when present it obeys the same rules. */
+    creds = tls_test_valid_creds();
+    creds.ca_pem = (const uint8_t *)k_tls_test_ca_pem;
+    creds.ca_pem_len = sizeof(k_tls_test_ca_pem);
+    if (assert_true(jpv2g_tls_credentials_validate(&creds) == 0,
+                    "credentials with a well-formed CA must validate") != 0) return 1;
+    creds.ca_pem_len = sizeof(k_tls_test_ca_pem) - 1;
+    if (assert_true(jpv2g_tls_credentials_validate(&creds) == -EINVAL,
+                    "CA length not counting the NUL must be rejected") != 0) return 1;
+    creds = tls_test_valid_creds();
+    creds.ca_pem = NULL;
+    creds.ca_pem_len = 4;
+    if (assert_true(jpv2g_tls_credentials_validate(&creds) == -EINVAL,
+                    "NULL CA with a non-zero length must be rejected") != 0) return 1;
+    return 0;
+}
+
+/* The SECC config default must keep tls_mem_creds all-NULL: a NULL
+ * cert_pem is the accept path's signal to fall back to the file-path
+ * variant (and, without mbedtls, to refuse TLS exactly as today). */
+static int test_tls_secc_config_default_has_no_mem_creds(void) {
+    jpv2g_secc_config_t cfg;
+    memset(&cfg, 0xA5, sizeof(cfg)); /* poison to prove default clears it */
+    jpv2g_secc_config_default(&cfg);
+    if (assert_true(cfg.tls_mem_creds.cert_pem == NULL && cfg.tls_mem_creds.cert_pem_len == 0,
+                    "default config must not carry an in-memory cert") != 0) return 1;
+    if (assert_true(cfg.tls_mem_creds.key_pem == NULL && cfg.tls_mem_creds.key_pem_len == 0,
+                    "default config must not carry an in-memory key") != 0) return 1;
+    if (assert_true(cfg.tls_mem_creds.ca_pem == NULL && cfg.tls_mem_creds.ca_pem_len == 0,
+                    "default config must not carry an in-memory CA") != 0) return 1;
+    return 0;
+}
+
+#ifndef HAVE_MBEDTLS
+/* Stub-branch contract: every TLS entry point refuses with -ENOTSUP and
+ * leaves the fd to the caller, so a ClientHello on the auto-detect port
+ * is refused and closed exactly as the shipping firmware does today. */
+static int test_tls_stub_returns_enotsup(void) {
+    int sockets[2] = {-1, -1};
+    if (assert_true(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0,
+                    "socketpair for TLS stub test") != 0) return 1;
+    jpv2g_tls_socket_t sock;
+    memset(&sock, 0, sizeof(sock));
+    sock.fd = -1;
+
+    jpv2g_tls_credentials_t creds = tls_test_valid_creds();
+    if (assert_true(jpv2g_tls_server_wrap_mem(&sock, sockets[0], &creds, 1000) == -ENOTSUP,
+                    "stub jpv2g_tls_server_wrap_mem must return -ENOTSUP") != 0) return 1;
+    if (assert_true(jpv2g_tls_server_wrap(&sock, sockets[0], "cert.pem", "key.pem", NULL) == -ENOTSUP,
+                    "stub jpv2g_tls_server_wrap must return -ENOTSUP") != 0) return 1;
+    if (assert_true(!sock.secure,
+                    "stub wrap must never mark the socket secure") != 0) return 1;
+
+    /* The fd must still belong to the caller after a refused wrap: a
+     * second syscall on it has to succeed. */
+    if (assert_true(send(sockets[1], "x", 1, 0) == 1,
+                    "peer fd must remain usable after refused wrap") != 0) return 1;
+
+    uint8_t buf[4];
+    if (assert_true(jpv2g_tls_send(&sock, buf, sizeof(buf)) == -ENOTSUP,
+                    "stub jpv2g_tls_send must return -ENOTSUP") != 0) return 1;
+    if (assert_true(jpv2g_tls_recv(&sock, buf, sizeof(buf), 10) == -ENOTSUP,
+                    "stub jpv2g_tls_recv must return -ENOTSUP") != 0) return 1;
+
+    close(sockets[0]);
+    close(sockets[1]);
+    return 0;
+}
+#endif /* !HAVE_MBEDTLS */
+
 int main(void) {
     if (test_v2gtp_round_trip() != 0) return 1;
     if (test_v2gtp_length_bounds() != 0) return 1;
@@ -2216,6 +2362,11 @@ int main(void) {
     if (test_secc_stream_ignores_undecodable_midsession() != 0) return 1;
     if (test_din_session_setup_timestamp_gate() != 0) return 1;
     if (test_payment_selection_rejects_unoffered() != 0) return 1;
+#endif
+    if (test_tls_credentials_validation() != 0) return 1;
+    if (test_tls_secc_config_default_has_no_mem_creds() != 0) return 1;
+#ifndef HAVE_MBEDTLS
+    if (test_tls_stub_returns_enotsup() != 0) return 1;
 #endif
     printf("jpv2g_unit_test: PASS\n");
     return 0;
