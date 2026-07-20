@@ -2009,6 +2009,10 @@ static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
                        (int)sequence.phase,
                        secc_msg_name(mtype),
                        (int)req_ctx.protocol);
+            /* Surface the exact rejected message for the firmware EVT lane. */
+            secc->last_reject_phase = (int)sequence.phase;
+            secc->last_reject_type = (int)mtype;
+            secc->last_reject_protocol = (int)req_ctx.protocol;
             SECC_STREAM_EXIT(rc);
         }
         rc = jpv2g_secc_validate_request_session(secc, mtype, &req_ctx);

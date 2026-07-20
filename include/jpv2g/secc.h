@@ -107,6 +107,15 @@ typedef struct {
     bool din_advertised_energy_transfer_valid;
     int64_t meter_Wh;
     char meter_id[16];
+    /* Diagnostics (2026-07-20): the (phase, message-type, protocol) of the most
+     * recent request that failed the sequence gate. The stream loop's
+     * JPV2G_WARN goes to a debug UART the controller never reads; recording it
+     * here lets the firmware surface the exact rejected message on its
+     * never-gated EVT lane so a "session lost at SequenceError" is diagnosable
+     * without a full-firehose log. Zero-initialised by jpv2g_secc_init(). */
+    int last_reject_phase;
+    int last_reject_type;
+    int last_reject_protocol;
     /* Callbacks to build responses based on decoded requests. */
     int (*handle_request)(jpv2g_message_type_t type, const void *decoded, uint8_t *out, size_t out_len, size_t *written, void *user_ctx);
     void *user_ctx;
