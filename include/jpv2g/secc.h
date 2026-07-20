@@ -98,6 +98,15 @@ typedef struct {
      * the jpv2g_secc_init() memset. */
     uint8_t last_session_id[8];
     int64_t last_session_end_ms;
+    /* SP-1 S9 (2026-07-20): DC-ness of the paused session, captured by the
+     * stream loop (which owns the sequence FSM) when a Pause is retained, and
+     * re-applied one-shot to the fresh sequence when the resume is granted.
+     * Without this, a resumed DC session on a fresh TCP stream that goes
+     * CPD -> PowerDelivery(Start) is mis-inferred as AC by the
+     * first-passage rule in state_secc.c and the EV's CableCheck/PreCharge
+     * skip turns into a protocol error. */
+    bool last_session_was_dc;
+    bool resume_dc_pending;
     /* DIN 70121 ServiceDiscovery carries exactly one EnergyTransferType.
      * Keep the successfully encoded value as a per-session contract so CPD
      * cannot accept a different mode merely because it also appears in the

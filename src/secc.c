@@ -982,9 +982,14 @@ static const uint8_t *secc_resolve_session(jpv2g_secc_t *secc,
             secc_paused_session_resumable(secc, incoming_sid)) {
             memcpy(secc->session_id, incoming_sid, sizeof(secc->session_id));
             if (old_session_joined) *old_session_joined = true;
+            /* SP-1 S9: carry the paused session's DC-ness into the fresh
+             * sequence (consumed one-shot by the stream loop right after this
+             * SessionSetup dispatch). */
+            secc->resume_dc_pending = secc->last_session_was_dc;
             /* Consume the pause memory: a resume may only be honoured once. */
             memset(secc->last_session_id, 0, sizeof(secc->last_session_id));
             secc->last_session_end_ms = 0;
+            secc->last_session_was_dc = false;
         } else {
             jpv2g_generate_session_id(NULL, secc->session_id);
         }
@@ -2202,6 +2207,24 @@ static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
             last_msg = mtype;
             if (mtype == JPV2G_SESSION_STOP_REQ) {
                 saw_session_stop = true;
+                /* SP-1 S9: if the handler retained a Pause (non-zero
+                 * last_session_id), record whether the paused session had
+                 * negotiated DC — only the stream loop owns the sequence FSM
+                 * and can know. */
+                if (!secc_sid_all_zero(secc->last_session_id,
+                                       sizeof(secc->last_session_id))) {
+                    secc->last_session_was_dc =
+                        sequence.mode_known && sequence.dc_mode;
+                }
+            }
+            if (mtype == JPV2G_SESSION_SETUP_REQ && secc->resume_dc_pending) {
+                /* SP-1 S9 one-shot: a granted resume re-applies the paused
+                 * session's DC mode so CPD -> PowerDelivery(Start) on the
+                 * fresh stream is not mis-inferred as AC (state_secc.c
+                 * first-passage rule). */
+                sequence.dc_mode = true;
+                sequence.mode_known = true;
+                secc->resume_dc_pending = false;
             }
         }
         if (secc_timing_log_enabled(mtype)) {
