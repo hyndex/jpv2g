@@ -63,7 +63,7 @@ stateDiagram-v2
     CurrentDemand --> WeldingDetection: PowerDelivery(Stop)
     WeldingDetection --> SessionStop
     SessionStop --> [*]
-    note right of Authorization: EIM: Ongoing_WaitingForCustomerInteraction\n→ Finished when granted
+    note right of Authorization: EIM Ongoing_WaitingForCustomerInteraction until granted, then Finished
 ```
 
 ## 🔌 Embedding the SECC (C)
