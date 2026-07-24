@@ -125,6 +125,17 @@ typedef struct {
     int last_reject_phase;
     int last_reject_type;
     int last_reject_protocol;
+    /* [V2G2-539] send-then-terminate (2026-07-23 EV-interop L1/L2): a handler
+     * that encodes an application-level FAILED Res sets this flag so the
+     * stream loop transmits the response and THEN closes the stream. A
+     * non-zero handler rc tears the stream down BEFORE the Res is sent (the
+     * VEH-3 lesson), while returning 0 alone used to leave the stream open —
+     * a ResponseCode-ignoring EV (ccs32clara class) then sailed on as a
+     * zombie pseudo-EIM session, the exact FAILED-then-continue pattern the
+     * min-FAILED sequence errors already forbid. Cleared by the stream loop
+     * at stream start and after acting on it; zero-initialised by
+     * jpv2g_secc_init(). */
+    bool terminate_after_response;
     /* Callbacks to build responses based on decoded requests. */
     int (*handle_request)(jpv2g_message_type_t type, const void *decoded, uint8_t *out, size_t out_len, size_t *written, void *user_ctx);
     void *user_ctx;

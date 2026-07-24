@@ -1426,8 +1426,15 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
              * optional per the DIN state table, so nothing downstream caught
              * it). Encode the FAILED Res and return 0: a non-zero handler rc
              * tears the stream down BEFORE the Res transmits (the VEH-3
-             * lesson). The SelectedServiceList walk stays deliberately lenient
-             * (VEH-3: never punish a quirky EV for its ServiceID bookkeeping). */
+             * lesson). 2026-07-23 EV-interop L1: returning 0 alone left the
+             * stream OPEN after the FAILED — the sequence FSM had already
+             * advanced to AUTHORIZATION before this handler ran, so a
+             * ResponseCode-ignoring EV ran the exact zombie pseudo-EIM
+             * sequence the check was written to prevent. Raise
+             * terminate_after_response so the stream loop sends the Res and
+             * THEN closes ([V2G2-539] send-then-terminate). The
+             * SelectedServiceList walk stays deliberately lenient (VEH-3:
+             * never punish a quirky EV for its ServiceID bookkeeping). */
             if (req->protocol == JPV2G_PROTOCOL_DIN70121) {
                 din_responseCodeType code = din_responseCodeType_OK;
                 if (req->body) {
@@ -1435,6 +1442,7 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
                         (const struct din_ServicePaymentSelectionReqType *)req->body;
                     if (rq->SelectedPaymentOption != din_paymentOptionType_ExternalPayment) {
                         code = din_responseCodeType_FAILED_PaymentSelectionInvalid;
+                        secc->terminate_after_response = true;
                     }
                 }
                 return jpv2g_cbv2g_encode_din_service_payment_selection_res(sid, code, out, out_len, written);
@@ -1445,6 +1453,7 @@ int jpv2g_secc_default_handle(jpv2g_secc_t *secc,
                     (const struct iso2_PaymentServiceSelectionReqType *)req->body;
                 if (rq->SelectedPaymentOption != iso2_paymentOptionType_ExternalPayment) {
                     code = iso2_responseCodeType_FAILED_PaymentSelectionInvalid;
+                    secc->terminate_after_response = true;
                 }
             }
             return jpv2g_cbv2g_encode_payment_service_selection_res(sid, code, out, out_len, written);
@@ -1983,6 +1992,9 @@ static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
      * given rc. Saves us from having to touch every `return` to keep
      * obs->* in sync with what the FSM actually saw. */
     #define SECC_STREAM_EXIT(rc_) do { stream_rc = (rc_); goto stream_done; } while (0)
+    /* [V2G2-539] L1/L2: never let a stale send-then-terminate request from a
+     * previous connection kill this stream's first response. */
+    secc->terminate_after_response = false;
     for (;;) {
         jpv2g_v2gtp_t msg;
         int rc = secc_recv_v2gtp(recv_fn, recv_ctx, buf, sizeof(buf), &msg, timeout_ms);
@@ -2324,6 +2336,20 @@ static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
         rc = secc_send_bytes(send_fn, send_ctx, out, total, timeout_ms);
         const int64_t send_finished_ms = jpv2g_now_monotonic_ms();
         if (rc != 0) SECC_STREAM_EXIT(rc);
+        /* 2026-07-23 EV-interop L1/L2 ([V2G2-539] send-then-terminate): a
+         * handler that answered with an application-level FAILED Res raised
+         * this flag; the Res is now on the wire, so close the stream exactly
+         * like the min-FAILED sequence errors do. Leaving it open let a
+         * ResponseCode-ignoring EV (ccs32clara class) continue as a zombie
+         * pseudo-EIM session past a FAILED PaymentServiceSelection /
+         * Authorization. The graceful stream_done teardown (SHUT_WR + drain)
+         * still applies — the EV sees FIN, never RST. */
+        if (secc->terminate_after_response) {
+            secc->terminate_after_response = false;
+            JPV2G_WARN("Application FAILED %s sent; terminating stream ([V2G2-539])",
+                       secc_msg_name(mtype));
+            SECC_STREAM_EXIT(-ECONNABORTED);
+        }
 #ifdef JPV2G_ENABLE_ISO20
         if (mtype == JPV2G_SUPP_APP_PROTOCOL_REQ &&
             protocol == JPV2G_PROTOCOL_ISO15118_20_DC) {
