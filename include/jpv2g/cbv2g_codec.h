@@ -388,9 +388,12 @@ int jpv2g_cbv2g_encode_din_cable_check_res(const uint8_t session_id[din_sessionI
  * ResponseCode names the failure, THEN terminate — a silent TCP RST reads as
  * "EVSE died" to the vehicle and several stacks retry-loop on it. The
  * dispatcher reuses the existing per-message encoders (the same proven paths
- * production responses take) with the FAILED code and, for the DC energy
- * messages, an explicit fail-shaped DC_EVSEStatus (StopCharging notification,
- * isolation Invalid) mirroring Josev's failed_responses tables. Covers every
+ * production responses take) with the FAILED code; the DC energy messages
+ * carry the NULL-payload normal default fill (EVSENotification=None,
+ * EVSE_Ready, isolation Valid) — a deliberate schema filler, not a claim
+ * (EV_INTEROP_CONTRACT.md §3.3): a conformant EV acts on the FAILED
+ * ResponseCode before reading the body. Do NOT "fix" this toward a
+ * fail-shaped status without a wire-capture interop pass. Covers every
  * DIN + ISO2 message type the stream dispatcher can produce; returns -ENOTSUP
  * for types that have their own response path (SupportedAppProtocol) so the
  * caller falls back to plain termination. */

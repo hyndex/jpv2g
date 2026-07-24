@@ -53,6 +53,7 @@ typedef enum {
     JPV2G_HLC_DROP_INVALID_ARG = 10,          /* misuse of the API */
     JPV2G_HLC_DROP_SEQUENCE_ERROR = 11,        /* decoded request is invalid in the current protocol phase */
     JPV2G_HLC_DROP_UNKNOWN_SESSION = 12,       /* missing, stale, or mismatched V2G SessionID */
+    JPV2G_HLC_DROP_APP_REJECTED = 13,          /* deliberate send-then-terminate after an application-level FAILED Res ([V2G2-539]) */
 } jpv2g_hlc_drop_reason_t;
 
 /* Map a rc returned from jpv2g_secc_handle_client_detect() (or the

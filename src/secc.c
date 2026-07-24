@@ -1025,6 +1025,15 @@ static const uint8_t *secc_resolve_session(jpv2g_secc_t *secc,
             secc->last_session_end_ms = 0;
             secc->last_session_was_dc = false;
         } else {
+            /* A NEW session must never inherit a resume grant. The flag is
+             * consumed only after a SUCCESSFUL SessionSetupRes send; every
+             * exit between grant and consume (handler error, encode failure,
+             * TCP send failure) leaves it set, and without this clear it
+             * fired on the next SessionSetup — one the SECC answered
+             * OK_NewSessionEstablished — over-permitting the CableCheck/
+             * PreCharge skip (and, in library use without a full-stack
+             * rebuild between plugs, on a different vehicle entirely). */
+            secc->resume_dc_pending = false;
             jpv2g_generate_session_id(NULL, secc->session_id);
         }
         return secc->session_id;
@@ -2348,7 +2357,11 @@ static int jpv2g_secc_handle_stream_obs(jpv2g_secc_t *secc,
             secc->terminate_after_response = false;
             JPV2G_WARN("Application FAILED %s sent; terminating stream ([V2G2-539])",
                        secc_msg_name(mtype));
-            SECC_STREAM_EXIT(-ECONNABORTED);
+            /* -ESHUTDOWN: reserved for THIS deliberate exit so
+             * jpv2g_secc_classify_disconnect can report AppRejected.
+             * -ECONNABORTED is taken by the TLS server-side handshake-abort
+             * path (tls.c) and must keep its transport-failure semantics. */
+            SECC_STREAM_EXIT(-ESHUTDOWN);
         }
 #ifdef JPV2G_ENABLE_ISO20
         if (mtype == JPV2G_SUPP_APP_PROTOCOL_REQ &&
@@ -2548,6 +2561,7 @@ const char *jpv2g_hlc_drop_reason_name(jpv2g_hlc_drop_reason_t reason) {
         case JPV2G_HLC_DROP_INVALID_ARG:          return "InvalidArg";
         case JPV2G_HLC_DROP_SEQUENCE_ERROR:       return "SequenceError";
         case JPV2G_HLC_DROP_UNKNOWN_SESSION:      return "UnknownSession";
+        case JPV2G_HLC_DROP_APP_REJECTED:         return "AppRejected";
         case JPV2G_HLC_DROP_UNKNOWN:
         default:                                   return "Unknown";
     }
@@ -2571,6 +2585,13 @@ jpv2g_hlc_drop_reason_t jpv2g_secc_classify_disconnect(int rc,
     }
     if (rc == -ECONNRESET) {
         return JPV2G_HLC_DROP_PEER_RESET;
+    }
+    if (rc == -ESHUTDOWN) {
+        /* [V2G2-539] send-then-terminate: the SECC flushed an application-level
+         * FAILED Res and closed deliberately. Without this branch the exit fell
+         * through to TcpRecvFail and a deliberate auth/CPD rejection read as a
+         * phantom transport failure on the diagnostics/EVT lane. */
+        return JPV2G_HLC_DROP_APP_REJECTED;
     }
     if (rc == -EBADMSG || rc == -ENOSPC || rc == -E2BIG) {
         return JPV2G_HLC_DROP_CODEC_ERROR;

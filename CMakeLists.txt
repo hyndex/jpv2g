@@ -59,11 +59,14 @@ set(JPV2G_FULL_SOURCES
 
 # The -20 module needs exactly these 6 generated codec files — never the
 # upstream cbv2g_iso20 target, which drags in AC/ACDP/WPT (~77k dead LOC).
-# This list is the canonical footprint contract mirrored by the firmware's
-# extra_script.py BuildSources filter. (The bundled-cbv2g glob also compiles
-# them into libcbv2g.a; the duplicate archive members are inert — the linker
-# resolves each symbol once — and this explicit list is what makes an
-# external-cbv2g build work at all.)
+# NOTE: the firmware's extra_script.py has NO corresponding source filter —
+# it BuildSources the whole cbv2g tree and relies on --gc-sections to drop
+# the unreferenced codecs. If JPV2G_ENABLE_ISO20 is ever turned ON in the
+# firmware, nothing there enforces this 6-file footprint; re-verify the
+# flash budget then. (The bundled-cbv2g glob also compiles them into
+# libcbv2g.a; the duplicate archive members are inert — the linker resolves
+# each symbol once — and this explicit list is what makes an external-cbv2g
+# build work at all.)
 set(JPV2G_ISO20_CODEC_SOURCES
     3rd_party/cbv2g/lib/cbv2g/iso_20/iso20_CommonMessages_Datatypes.c
     3rd_party/cbv2g/lib/cbv2g/iso_20/iso20_CommonMessages_Decoder.c
