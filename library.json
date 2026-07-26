@@ -1,0 +1,21 @@
+{
+  "name": "jpv2g",
+  "version": "0.1.0",
+  "description": "ISO 15118-2 / DIN 70121 SECC and EVCC with vendored cbv2g EXI codec",
+  "license": "Apache-2.0",
+  "frameworks": "*",
+  "platforms": "*",
+  "build": {
+    "srcDir": ".",
+    "srcFilter": [
+      "+<src/>",
+      "+<3rd_party/cbv2g/lib/cbv2g/>"
+    ],
+    "includeDir": "include",
+    "flags": [
+      "-I3rd_party/cbv2g/include",
+      "-I3rd_party/cbv2g/lib"
+    ],
+    "libArchive": true
+  }
+}
