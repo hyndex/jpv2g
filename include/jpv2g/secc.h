@@ -182,6 +182,15 @@ int jpv2g_secc_handle_client_detect_ex(jpv2g_secc_t *secc,
                                         bool *out_saw_session_stop);
 
 /* Enable/disable verbose decoded request/response logs (enabled by default). */
+/* Restrict which application protocols this SECC will negotiate. Bitmask of
+ * JPV2G_PROTOCOL_MASK_*; default is all supported. A zero mask is ignored — a charger that
+ * negotiates nothing answers no vehicle, and no caller means that. */
+#define JPV2G_PROTOCOL_MASK_DIN  0x01u
+#define JPV2G_PROTOCOL_MASK_ISO2 0x02u
+#define JPV2G_PROTOCOL_MASK_ALL  0xFFFFFFFFu
+void jpv2g_secc_set_protocol_mask(uint32_t mask);
+uint32_t jpv2g_secc_get_protocol_mask(void);
+
 void jpv2g_secc_set_decoded_logs(bool enable);
 bool jpv2g_secc_get_decoded_logs(void);
 void jpv2g_secc_set_timing_logs(bool enable);

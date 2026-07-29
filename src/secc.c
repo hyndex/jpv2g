@@ -48,6 +48,34 @@ static bool secc_timing_log_enabled(jpv2g_message_type_t mtype) {
            (mtype == JPV2G_PRE_CHARGE_REQ || mtype == JPV2G_POWER_DELIVERY_REQ || mtype == JPV2G_CURRENT_DEMAND_REQ);
 }
 
+/* WHICH APPLICATION PROTOCOLS THIS SECC WILL NEGOTIATE.
+ *
+ * Default is everything the build supports, so a caller that never touches this behaves exactly
+ * as before. It exists for interop triage: when one vehicle fails on ISO 15118-2 and works on
+ * DIN 70121, restricting the offer answers "is it the protocol?" in a single session instead of
+ * a firmware rebuild — and it has to happen HERE, at SupportedAppProtocol, because refusing
+ * later just fails the session rather than letting the EV fall back.
+ *
+ * A mask of zero would mean "negotiate nothing", i.e. a charger that answers no vehicle. That
+ * is never what a caller meant, so it is ignored rather than obeyed. */
+static uint32_t s_protocol_mask = JPV2G_PROTOCOL_MASK_ALL;
+
+void jpv2g_secc_set_protocol_mask(uint32_t mask) {
+    if (mask != 0u) s_protocol_mask = mask;
+}
+
+uint32_t jpv2g_secc_get_protocol_mask(void) {
+    return s_protocol_mask;
+}
+
+static bool protocol_enabled(jpv2g_protocol_t p) {
+    switch (p) {
+        case JPV2G_PROTOCOL_DIN70121:    return (s_protocol_mask & JPV2G_PROTOCOL_MASK_DIN) != 0u;
+        case JPV2G_PROTOCOL_ISO15118_2:  return (s_protocol_mask & JPV2G_PROTOCOL_MASK_ISO2) != 0u;
+        default:                         return true;   /* -20 has its own gate */
+    }
+}
+
 void jpv2g_secc_set_decoded_logs(bool enable) {
     s_enable_decoded_logs = enable;
 }
@@ -173,6 +201,13 @@ static secc_app_selection_t select_app_protocol(const struct appHand_supportedAp
             candidate = JPV2G_PROTOCOL_ISO15118_2;
         } else if (app_protocol_offer_matches(ap, JPV2G_PROTOCOL_DIN70121)) {
             candidate = JPV2G_PROTOCOL_DIN70121;
+        }
+        /* A masked-out protocol is treated as one this SECC does not implement: the offer is
+         * skipped, the EV's next-priority offer is considered, and the response code ends up
+         * Failed_NoNegotiation only if NOTHING mutually supported remains. That is what lets a
+         * car fall back to DIN rather than simply failing. */
+        if (candidate != JPV2G_PROTOCOL_UNKNOWN && !protocol_enabled(candidate)) {
+            continue;
         }
 #ifdef JPV2G_ENABLE_ISO20
         else if (app_protocol_offer_matches(ap, JPV2G_PROTOCOL_ISO15118_20_DC)) {
